@@ -218,20 +218,9 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
       pose.pose.orientation = goal.pose.orientation;
     }
     path.poses.push_back(pose);
-  } else {
-    const auto original_start_cost = costmap_->getCost(mx_start, my_start);
-    try {
-      if (!makePlan(start.pose, goal.pose, tolerance_, cancel_checker, path)) {
-        throw nav2_core::NoValidPathCouldBeFound(
-                "Failed to create plan with tolerance of: " + std::to_string(tolerance_) );
-      }
-    } catch (...) {
-      if (enable_path_smoothing_) {costmap_->setCost(mx_start, my_start, original_start_cost);}
-      throw;
-    }
-    // Navfn clears this cell for search. Safety validation and later requests
-    // must still see the observed obstacle, not the search's temporary override.
-    if (enable_path_smoothing_) {costmap_->setCost(mx_start, my_start, original_start_cost);}
+  } else if (!makePlan(start.pose, goal.pose, tolerance_, cancel_checker, path)) {
+    throw nav2_core::NoValidPathCouldBeFound(
+            "Failed to create plan with tolerance of: " + std::to_string(tolerance_));
   }
 
   const auto publish_raw = [&]() {
@@ -323,20 +312,22 @@ NavfnPlanner::makePlan(
   plan.header.stamp = clock_->now();
   plan.header.frame_id = global_frame_;
 
-  double wx = start.position.x;
-  double wy = start.position.y;
-
   RCLCPP_DEBUG(
     logger_, "Making plan from (%.2f,%.2f) to (%.2f,%.2f)",
     start.position.x, start.position.y, goal.position.x, goal.position.y);
 
-  unsigned int mx, my;
-  worldToMap(wx, wy, mx, my);
-
-  // clear the starting cell within the costmap because we know it can't be an obstacle
-  clearRobotCell(mx, my);
-
   std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(costmap_->getMutex()));
+  unsigned int sx, sy, gx, gy;
+  if (!worldToMap(start.position.x, start.position.y, sx, sy)) {
+    throw nav2_core::StartOutsideMapBounds("Start rounds outside the NavFn search grid");
+  }
+  if (!worldToMap(goal.position.x, goal.position.y, gx, gy)) {
+    // A physical edge cell can round beyond NavFn's grid. Use that cell only
+    // as the propagation target; the tolerance search selects the actual endpoint.
+    if (tolerance <= 0 || !costmap_->worldToMap(goal.position.x, goal.position.y, gx, gy)) {
+      throw nav2_core::GoalOutsideMapBounds("Goal rounds outside the NavFn search grid");
+    }
+  }
 
   // make sure to resize the underlying array that Navfn uses
   planner_->setNavArr(
@@ -345,18 +336,11 @@ NavfnPlanner::makePlan(
 
   planner_->setCostmap(costmap_->getCharMap(), true, allow_unknown_);
 
-  int map_start[2];
-  map_start[0] = mx;
-  map_start[1] = my;
+  // ROS free space maps to COST_NEUTRAL in NavFn's private cost array.
+  planner_->costarr[sy * planner_->nx + sx] = COST_NEUTRAL;
 
-  wx = goal.position.x;
-  wy = goal.position.y;
-
-  worldToMap(wx, wy, mx, my);
-  int map_goal[2];
-  map_goal[0] = mx;
-  map_goal[1] = my;
-
+  int map_start[2] = {static_cast<int>(sx), static_cast<int>(sy)};
+  int map_goal[2] = {static_cast<int>(gx), static_cast<int>(gy)};
   planner_->setStart(map_goal);
   planner_->setGoal(map_start);
   if (use_astar_) {
@@ -566,7 +550,7 @@ NavfnPlanner::getPlanFromPotential(
 
   // the potential has already been computed, so we won't update our copy of the costmap
   unsigned int mx, my;
-  worldToMap(wx, wy, mx, my);
+  if (!worldToMap(wx, wy, mx, my)) {return false;}
 
   int map_goal[2];
   map_goal[0] = mx;
@@ -628,21 +612,14 @@ NavfnPlanner::worldToMap(double wx, double wy, unsigned int & mx, unsigned int &
     return false;
   }
 
-  mx = static_cast<int>(
-    std::round((wx - costmap_->getOriginX()) / costmap_->getResolution()));
-  my = static_cast<int>(
-    std::round((wy - costmap_->getOriginY()) / costmap_->getResolution()));
-
-  if (mx < costmap_->getSizeInCellsX() && my < costmap_->getSizeInCellsY()) {
-    return true;
+  const double x = std::round((wx - costmap_->getOriginX()) / costmap_->getResolution());
+  const double y = std::round((wy - costmap_->getOriginY()) / costmap_->getResolution());
+  if (!(x >= 0 && x < costmap_->getSizeInCellsX() && y >= 0 && y < costmap_->getSizeInCellsY())) {
+    return false;
   }
-
-  RCLCPP_ERROR(
-    logger_,
-    "worldToMap failed: mx,my: %d,%d, size_x,size_y: %d,%d", mx, my,
-    costmap_->getSizeInCellsX(), costmap_->getSizeInCellsY());
-
-  return false;
+  mx = static_cast<unsigned int>(x);
+  my = static_cast<unsigned int>(y);
+  return true;
 }
 
 void
@@ -650,14 +627,6 @@ NavfnPlanner::mapToWorld(double mx, double my, double & wx, double & wy)
 {
   wx = costmap_->getOriginX() + mx * costmap_->getResolution();
   wy = costmap_->getOriginY() + my * costmap_->getResolution();
-}
-
-void
-NavfnPlanner::clearRobotCell(unsigned int mx, unsigned int my)
-{
-  // TODO(orduno): check usage of this function, might instead be a request to
-  //               world_model / map server
-  costmap_->setCost(mx, my, nav2_costmap_2d::FREE_SPACE);
 }
 
 rcl_interfaces::msg::SetParametersResult

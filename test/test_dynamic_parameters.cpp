@@ -78,6 +78,8 @@ public:
     smoothing_options_.max_smoothing_time_ms = 1000.0;
   }
 
+  unsigned char cellCost(unsigned int x, unsigned int y) const {return map_.getCost(x, y);}
+
   void setTolerance(double tolerance) {tolerance_ = tolerance;}
 
   void finish(const geometry_msgs::msg::Pose & goal, nav_msgs::msg::Path & path)
@@ -234,6 +236,61 @@ TEST(NavfnTest, SearchStartCellClearingDoesNotHideFootprintCollision)
   for (int request = 0; request < 2; ++request) {
     EXPECT_THROW(planner.createPlan(start, goal, [] {return false;}),
       nav2_core::NoValidPathCouldBeFound);
+  }
+}
+
+TEST(NavfnTest, OffGridStartChangesOnlyPrivateSearchCosts)
+{
+  for (bool smoothing : {false, true}) {
+    OpenMapPlanner planner(true, false);
+    if (smoothing) {planner.enableSmoothing();}
+    geometry_msgs::msg::PoseStamped start, goal;
+    start.pose.position.x = 0.03;  // physical cell 100, NavFn cell 101
+    start.pose.orientation.w = goal.pose.orientation.w = 1.0;
+    goal.pose.position.x = 1.0;
+    planner.setCost(0.03, 0.0, 37);
+    for (unsigned char search_cost : {87, 254}) {
+      planner.setCost(0.06, 0.0, search_cost);
+      const auto check_map = [&]() {
+          EXPECT_EQ(planner.cellCost(100, 100), 37);
+          EXPECT_EQ(planner.cellCost(101, 100), search_cost);
+        };
+      EXPECT_THROW(planner.createPlan(start, goal, [] {return true;}), nav2_core::PlannerCancelled);
+      check_map();
+      for (int request = 0; request < 2; ++request) {
+        if (smoothing && search_cost == 254) {
+          EXPECT_THROW(planner.createPlan(start, goal, [] {return false;}),
+            nav2_core::NoValidPathCouldBeFound);
+        } else {
+          const auto path = planner.createPlan(start, goal, [] {return false;});
+          ASSERT_FALSE(path.poses.empty());
+          EXPECT_EQ(path.poses.back().pose.position, goal.pose.position);
+        }
+        check_map();
+      }
+    }
+  }
+}
+
+TEST(NavfnTest, RoundedUpperAndRightEdgesRespectGoalTolerance)
+{
+  for (bool astar : {false, true}) {
+    for (bool right_edge : {false, true}) {
+      OpenMapPlanner planner(astar, false);
+      geometry_msgs::msg::PoseStamped inside, edge;
+      inside.pose.orientation.w = edge.pose.orientation.w = 1.0;
+      (right_edge ? inside.pose.position.x : inside.pose.position.y) = 4.0;
+      (right_edge ? edge.pose.position.x : edge.pose.position.y) = 4.99;
+      EXPECT_THROW(planner.createPlan(edge, inside, [] {return false;}), nav2_core::StartOutsideMapBounds);
+      EXPECT_THROW(planner.createPlan(inside, edge, [] {return false;}), nav2_core::GoalOutsideMapBounds);
+      planner.setTolerance(0.20);
+      const auto path = planner.createPlan(inside, edge, [] {return false;});
+      ASSERT_FALSE(path.poses.empty());
+      const auto & end = path.poses.back().pose.position;
+      const double distance = std::hypot(end.x - edge.pose.position.x, end.y - edge.pose.position.y);
+      EXPECT_GT(distance, 0.0);
+      EXPECT_LE(distance, 0.20);
+    }
   }
 }
 
