@@ -67,6 +67,7 @@ NavfnPlanner::configure(
 {
   tf_ = tf;
   name_ = name;
+  costmap_ros_ = costmap_ros;
   costmap_ = costmap_ros->getCostmap();
   global_frame_ = costmap_ros->getGlobalFrameID();
 
@@ -91,6 +92,28 @@ NavfnPlanner::configure(
     node, name + ".use_final_approach_orientation", rclcpp::ParameterValue(false));
   node->get_parameter(name + ".use_final_approach_orientation", use_final_approach_orientation_);
 
+  declare_parameter_if_not_declared(
+    node, name + ".enable_path_smoothing", rclcpp::ParameterValue(false));
+  node->get_parameter(name + ".enable_path_smoothing", enable_path_smoothing_);
+  declare_parameter_if_not_declared(node, name + ".use_rdp", rclcpp::ParameterValue(false));
+  node->get_parameter(name + ".use_rdp", smoothing_options_.use_rdp);
+  declare_parameter_if_not_declared(node, name + ".rdp_epsilon", rclcpp::ParameterValue(0.08));
+  node->get_parameter(name + ".rdp_epsilon", smoothing_options_.rdp_epsilon);
+  declare_parameter_if_not_declared(node, name + ".output_spacing", rclcpp::ParameterValue(0.04));
+  node->get_parameter(name + ".output_spacing", smoothing_options_.output_spacing);
+  declare_parameter_if_not_declared(
+    node, name + ".maximum_deviation", rclcpp::ParameterValue(0.10));
+  node->get_parameter(name + ".maximum_deviation", smoothing_options_.maximum_deviation);
+  declare_parameter_if_not_declared(
+    node, name + ".max_smoothing_time_ms", rclcpp::ParameterValue(100.0));
+  node->get_parameter(name + ".max_smoothing_time_ms", smoothing_options_.max_smoothing_time_ms);
+  if (!rbs_navfn_smoother::validSmoothingOptions(smoothing_options_)) {
+    throw nav2_core::PlannerException("Invalid path smoothing parameters");
+  }
+
+  raw_plan_pub_ = node->create_publisher<nav_msgs::msg::Path>("raw_plan", 1);
+  smoothed_plan_pub_ = node->create_publisher<nav_msgs::msg::Path>("smoothed_plan", 1);
+
   // Create a planner based on the new costmap size
   planner_ = std::make_unique<NavFn>(
     costmap_->getSizeInCellsX(),
@@ -103,6 +126,8 @@ NavfnPlanner::activate()
   RCLCPP_INFO(
     logger_, "Activating plugin %s of type NavfnPlanner",
     name_.c_str());
+  raw_plan_pub_->on_activate();
+  smoothed_plan_pub_->on_activate();
   // Add callback for dynamic parameters
   auto node = node_.lock();
   dyn_params_handler_ = node->add_on_set_parameters_callback(
@@ -120,6 +145,8 @@ NavfnPlanner::deactivate()
     node->remove_on_set_parameters_callback(dyn_params_handler_.get());
   }
   dyn_params_handler_.reset();
+  raw_plan_pub_->on_deactivate();
+  smoothed_plan_pub_->on_deactivate();
 }
 
 void
@@ -128,7 +155,10 @@ NavfnPlanner::cleanup()
   RCLCPP_INFO(
     logger_, "Cleaning up plugin %s of type NavfnPlanner",
     name_.c_str());
+  raw_plan_pub_.reset();
+  smoothed_plan_pub_.reset();
   planner_.reset();
+  costmap_ros_.reset();
 }
 
 nav_msgs::msg::Path NavfnPlanner::createPlan(
@@ -136,6 +166,7 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
   const geometry_msgs::msg::PoseStamped & goal,
   std::function<bool()> cancel_checker)
 {
+  std::lock_guard<std::mutex> planner_lock(planner_mutex_);
   std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> costmap_lock(
     *(costmap_->getMutex()));
 
@@ -188,12 +219,74 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
       pose.pose.orientation = goal.pose.orientation;
     }
     path.poses.push_back(pose);
-    return path;
+  } else {
+    const auto original_start_cost = costmap_->getCost(mx_start, my_start);
+    try {
+      if (!makePlan(start.pose, goal.pose, tolerance_, cancel_checker, path)) {
+        throw nav2_core::NoValidPathCouldBeFound(
+                "Failed to create plan with tolerance of: " + std::to_string(tolerance_) );
+      }
+    } catch (...) {
+      if (enable_path_smoothing_) {costmap_->setCost(mx_start, my_start, original_start_cost);}
+      throw;
+    }
+    // Navfn clears this cell for search. Safety validation and later requests
+    // must still see the observed obstacle, not the search's temporary override.
+    if (enable_path_smoothing_) {costmap_->setCost(mx_start, my_start, original_start_cost);}
   }
 
-  if (!makePlan(start.pose, goal.pose, tolerance_, cancel_checker, path)) {
-    throw nav2_core::NoValidPathCouldBeFound(
-            "Failed to create plan with tolerance of: " + std::to_string(tolerance_) );
+  const auto publish_raw = [&]() {
+      if (raw_plan_pub_) {raw_plan_pub_->publish(path);}
+    };
+  if (enable_path_smoothing_) {
+    const auto smoothing_start = std::chrono::steady_clock::now();
+    if (cancel_checker && cancel_checker()) {
+      throw nav2_core::PlannerCancelled("Path smoothing cancelled");
+    }
+    if (!costmap_ros_) {
+      throw nav2_core::NoValidPathCouldBeFound("Missing costmap footprint for smoothing");
+    }
+    nav2_msgs::msg::Costmap snapshot;
+    snapshot.header = path.header;
+    snapshot.metadata.size_x = costmap_->getSizeInCellsX();
+    snapshot.metadata.size_y = costmap_->getSizeInCellsY();
+    snapshot.metadata.resolution = costmap_->getResolution();
+    snapshot.metadata.origin.position.x = costmap_->getOriginX();
+    snapshot.metadata.origin.position.y = costmap_->getOriginY();
+    snapshot.metadata.origin.orientation.w = 1.0;
+    const size_t cell_count = static_cast<size_t>(snapshot.metadata.size_x) *
+      snapshot.metadata.size_y;
+    snapshot.data.assign(costmap_->getCharMap(), costmap_->getCharMap() + cell_count);
+    const auto footprint = costmap_ros_->getRobotFootprint();
+    costmap_lock.unlock();
+    publish_raw();
+
+    auto options = smoothing_options_;
+    options.allow_unknown = allow_unknown_;
+    options.use_final_approach_orientation = use_final_approach_orientation_;
+    const auto process_start = std::chrono::steady_clock::now();
+    auto result = rbs_navfn_smoother::processPath(
+      path, snapshot, footprint, options, cancel_checker, &start.pose, smoothing_start);
+    const auto finish = std::chrono::steady_clock::now();
+    using Milliseconds = std::chrono::duration<double, std::milli>;
+    RCLCPP_INFO(
+      logger_, "RBS_NAVFN_SMOOTHING process_ms=%.3f total_ms=%.3f result=%s raw_poses=%zu output_poses=%zu",
+      Milliseconds(finish - process_start).count(), Milliseconds(finish - smoothing_start).count(),
+      result.reason.c_str(), path.poses.size(), result.path.poses.size());
+    if (result.cancelled) {
+      throw nav2_core::PlannerCancelled("Path smoothing cancelled");
+    }
+    if (!result.valid) {
+      if (result.timed_out) {
+        throw nav2_core::PlannerTimedOut("Path smoothing timed out without a validated path");
+      }
+      throw nav2_core::NoValidPathCouldBeFound("Path smoothing failed: " + result.reason);
+    }
+    path = std::move(result.path);
+    if (smoothed_plan_pub_) {smoothed_plan_pub_->publish(path);}
+  } else {
+    costmap_lock.unlock();
+    publish_raw();
   }
 
 
@@ -611,7 +704,29 @@ NavfnPlanner::clearRobotCell(unsigned int mx, unsigned int my)
 rcl_interfaces::msg::SetParametersResult
 NavfnPlanner::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameters)
 {
+  std::lock_guard<std::mutex> lock(planner_mutex_);
   rcl_interfaces::msg::SetParametersResult result;
+  auto smoothing = smoothing_options_;
+  bool enabled = enable_path_smoothing_;
+  for (const auto & parameter : parameters) {
+    const auto & name = parameter.get_name();
+    if (name == name_ + ".enable_path_smoothing") {enabled = parameter.as_bool();}
+    if (name == name_ + ".use_rdp") {smoothing.use_rdp = parameter.as_bool();}
+    if (name == name_ + ".rdp_epsilon") {smoothing.rdp_epsilon = parameter.as_double();}
+    if (name == name_ + ".output_spacing") {smoothing.output_spacing = parameter.as_double();}
+    if (name == name_ + ".maximum_deviation") {smoothing.maximum_deviation = parameter.as_double();}
+    if (name == name_ + ".max_smoothing_time_ms") {
+      smoothing.max_smoothing_time_ms = parameter.as_double();
+    }
+  }
+  if (!rbs_navfn_smoother::validSmoothingOptions(smoothing)) {
+    result.successful = false;
+    result.reason =
+      "Smoothing spacing/time must be positive, epsilon/deviation nonnegative and finite";
+    return result;
+  }
+  smoothing_options_ = smoothing;
+  enable_path_smoothing_ = enabled;
   for (auto parameter : parameters) {
     const auto & type = parameter.get_type();
     const auto & name = parameter.get_name();

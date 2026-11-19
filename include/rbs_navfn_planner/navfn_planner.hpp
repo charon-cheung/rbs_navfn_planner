@@ -20,8 +20,10 @@
 #include <chrono>
 #include <string>
 #include <memory>
+#include <mutex>
 #include <vector>
 
+#include "rbs_navfn_smoother/path_smoothing_pipeline.hpp"
 #include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav2_core/global_planner.hpp"
@@ -203,6 +205,13 @@ protected:
 
   // Logger
   rclcpp::Logger logger_{rclcpp::get_logger("NavfnPlanner")};
+
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr raw_plan_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr smoothed_plan_pub_;
+  std::mutex planner_mutex_;
+  std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros_;
+  bool enable_path_smoothing_{false};
+  rbs_navfn_smoother::SmoothingOptions smoothing_options_;
 
   // Global Costmap
   nav2_costmap_2d::Costmap2D * costmap_;

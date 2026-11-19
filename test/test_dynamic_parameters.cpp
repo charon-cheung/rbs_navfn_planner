@@ -14,7 +14,10 @@
 
 #include <math.h>
 
+#include <algorithm>
+#include <chrono>
 #include <memory>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -55,6 +58,27 @@ public:
     use_astar_ = astar;
     use_final_approach_orientation_ = final_approach;
   }
+
+  ~OpenMapPlanner() override
+  {
+    if (costmap_ros_) {costmap_ros_->on_cleanup(rclcpp_lifecycle::State());}
+  }
+
+  void enableSmoothing()
+  {
+    costmap_ros_ = std::make_shared<nav2_costmap_2d::Costmap2DROS>("smoothing_test_costmap");
+    costmap_ros_->on_configure(rclcpp_lifecycle::State());
+    std::vector<geometry_msgs::msg::Point> footprint(4);
+    footprint[0].x = footprint[3].x = -0.25;
+    footprint[1].x = footprint[2].x = 0.25;
+    footprint[0].y = footprint[1].y = -0.10;
+    footprint[2].y = footprint[3].y = 0.10;
+    costmap_ros_->setRobotFootprint(footprint);
+    enable_path_smoothing_ = true;
+    smoothing_options_.max_smoothing_time_ms = 1000.0;
+  }
+
+  void setTolerance(double tolerance) {tolerance_ = tolerance;}
 
   void finish(const geometry_msgs::msg::Pose & goal, nav_msgs::msg::Path & path)
   {
@@ -158,6 +182,131 @@ TEST(NavfnTest, TranslationHeadingsFollowPathAndPreserveGoalPolicy)
   }
 }
 
+
+TEST(NavfnTest, SmoothingPreservesSearchEndpointsToleranceAndGoalPolicy)
+{
+  for (bool astar : {false, true}) {
+    for (bool final_approach : {false, true}) {
+      OpenMapPlanner planner(astar, final_approach);
+      planner.setTolerance(0.5);
+      geometry_msgs::msg::PoseStamped start, goal;
+      start.header.frame_id = goal.header.frame_id = "map";
+      start.pose.orientation.w = 1.0;
+      goal.pose.position.x = 2.03;
+      goal.pose.position.y = 0.04;
+      goal.pose.orientation.z = std::sin(0.6);
+      goal.pose.orientation.w = std::cos(0.6);
+      const auto raw = planner.createPlan(start, goal, [] {return false;});
+      planner.enableSmoothing();
+      const auto smooth = planner.createPlan(start, goal, [] {return false;});
+      ASSERT_GT(smooth.poses.size(), 2U);
+      EXPECT_EQ(smooth.poses.front().pose.position, raw.poses.front().pose.position);
+      EXPECT_EQ(smooth.poses.back().pose.position, raw.poses.back().pose.position);
+      const auto & a = smooth.poses[smooth.poses.size() - 2].pose.position;
+      const auto & b = smooth.poses.back().pose.position;
+      const auto & q = smooth.poses.back().pose.orientation;
+      const double expected = final_approach ? std::atan2(b.y - a.y, b.x - a.x) : 1.2;
+      EXPECT_NEAR(std::remainder(2 * std::atan2(q.z, q.w) - expected, 2 * M_PI), 0, 1e-6);
+      EXPECT_THROW(planner.createPlan(start, goal, [] {return true;}), nav2_core::PlannerCancelled);
+    }
+  }
+}
+
+TEST(NavfnTest, SmoothingRejectsFootprintCollisionOnSinglePosePath)
+{
+  OpenMapPlanner planner(false, false);
+  planner.enableSmoothing();
+  planner.setCost(0.2, 0.0, 254);
+  geometry_msgs::msg::PoseStamped pose;
+  pose.pose.orientation.w = 1.0;
+  EXPECT_THROW(planner.createPlan(pose, pose, [] {return false;}),
+    nav2_core::NoValidPathCouldBeFound);
+}
+
+TEST(NavfnTest, SearchStartCellClearingDoesNotHideFootprintCollision)
+{
+  OpenMapPlanner planner(false, false);
+  planner.enableSmoothing();
+  planner.setCost(0.0, 0.0, 254);
+  geometry_msgs::msg::PoseStamped start, goal;
+  start.pose.orientation.w = goal.pose.orientation.w = 1.0;
+  goal.pose.position.x = 1.0;
+  for (int request = 0; request < 2; ++request) {
+    EXPECT_THROW(planner.createPlan(start, goal, [] {return false;}),
+      nav2_core::NoValidPathCouldBeFound);
+  }
+}
+
+TEST(NavfnTest, SmoothingKeepsToleranceAdjustedEndpoint)
+{
+  for (bool astar : {false, true}) {
+    OpenMapPlanner planner(astar, false);
+    planner.setTolerance(0.5);
+    geometry_msgs::msg::PoseStamped start, goal;
+    start.pose.orientation.w = goal.pose.orientation.w = 1.0;
+    goal.pose.position.x = 2.0;
+    // Navfn cannot search through an inscribed cell; full-footprint validation
+    // uses the lethal cells rather than treating inflation as physical obstacles.
+    planner.setCost(2.0, 0.0, 253);
+    const auto raw = planner.createPlan(start, goal, [] {return false;});
+    ASSERT_NE(raw.poses.back().pose.position, goal.pose.position);
+    planner.enableSmoothing();
+    const auto smooth = planner.createPlan(start, goal, [] {return false;});
+    EXPECT_EQ(smooth.poses.back().pose.position, raw.poses.back().pose.position);
+  }
+}
+
+TEST(NavfnTest, PublishesRawAndReturnsTheSelectedPathForFollowPath)
+{
+  using Path = nav_msgs::msg::Path;
+  using namespace std::chrono_literals;
+  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("path_topics_test");
+  auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>("topics_costmap");
+  costmap->on_configure(rclcpp_lifecycle::State());
+  auto * map = costmap->getCostmap();
+  map->resizeMap(100, 100, 0.05, -2.5, -2.5);
+  std::fill_n(map->getCharMap(), 100 * 100, 0);
+  rbs_navfn_planner::NavfnPlanner planner;
+  planner.configure(node, "GridBased", nullptr, costmap);
+  planner.activate();
+  auto raw = node->create_subscription<Path>("raw_plan", 10, [](Path::ConstSharedPtr) {});
+  auto smoothed = node->create_subscription<Path>("smoothed_plan", 10, [](Path::ConstSharedPtr) {});
+  auto wait_until = [](auto ready) {
+      const auto deadline = std::chrono::steady_clock::now() + 3s;
+      while (!ready()) {
+        if (std::chrono::steady_clock::now() >= deadline) {return false;}
+        std::this_thread::sleep_for(5ms);
+      }
+      return true;
+    };
+  ASSERT_TRUE(wait_until([&] {
+        return node->count_subscribers("raw_plan") && node->count_subscribers("smoothed_plan");
+    }));
+  geometry_msgs::msg::PoseStamped start, goal;
+  start.pose.orientation.w = goal.pose.orientation.w = 1.0;
+  goal.pose.position.x = 1.0;
+  rclcpp::MessageInfo info;
+  Path raw_msg, smooth_msg;
+  for (bool enabled : {false, true, false}) {
+    ASSERT_TRUE(node->set_parameters_atomically({
+        rclcpp::Parameter("GridBased.enable_path_smoothing", enabled),
+        rclcpp::Parameter("GridBased.max_smoothing_time_ms", 1000.0)}).successful);
+    const auto selected = planner.createPlan(start, goal, [] {return false;});
+    ASSERT_TRUE(wait_until([&] {return raw->take(raw_msg, info);}));
+    if (enabled) {
+      ASSERT_TRUE(wait_until([&] {return smoothed->take(smooth_msg, info);}));
+      EXPECT_EQ(selected, smooth_msg);
+      EXPECT_NE(raw_msg.poses.size(), smooth_msg.poses.size());
+    } else {
+      EXPECT_EQ(selected, raw_msg);
+      EXPECT_FALSE(smoothed->take(smooth_msg, info));
+    }
+  }
+  planner.deactivate();
+  planner.cleanup();
+  costmap->on_cleanup(rclcpp_lifecycle::State());
+}
+
 TEST(NavfnTest, testDynamicParameter)
 {
   auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("Navfntest");
@@ -178,14 +327,26 @@ TEST(NavfnTest, testDynamicParameter)
     {rclcpp::Parameter("test.tolerance", 1.0),
       rclcpp::Parameter("test.use_astar", true),
       rclcpp::Parameter("test.allow_unknown", true),
-      rclcpp::Parameter("test.use_final_approach_orientation", true)});
+      rclcpp::Parameter("test.use_final_approach_orientation", true),
+      rclcpp::Parameter("test.enable_path_smoothing", true),
+      rclcpp::Parameter("test.output_spacing", 0.05)});
 
   rclcpp::spin_until_future_complete(
     node->get_node_base_interface(),
     results);
 
+  ASSERT_TRUE(results.get().successful);
+  const auto rejected = node->set_parameters_atomically({
+    rclcpp::Parameter("test.output_spacing", 0.0),
+    rclcpp::Parameter("test.enable_path_smoothing", false)});
+  EXPECT_FALSE(rejected.successful);
+  EXPECT_TRUE(node->get_parameter("test.enable_path_smoothing").as_bool());
+  EXPECT_DOUBLE_EQ(node->get_parameter("test.output_spacing").as_double(), 0.05);
   EXPECT_EQ(node->get_parameter("test.tolerance").as_double(), 1.0);
   EXPECT_EQ(node->get_parameter("test.use_astar").as_bool(), true);
   EXPECT_EQ(node->get_parameter("test.allow_unknown").as_bool(), true);
   EXPECT_EQ(node->get_parameter("test.use_final_approach_orientation").as_bool(), true);
+  planner->deactivate();
+  planner->cleanup();
+  costmap->on_cleanup(rclcpp_lifecycle::State());
 }
