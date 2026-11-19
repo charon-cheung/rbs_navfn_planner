@@ -257,10 +257,13 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
       path, snapshot, footprint, options, cancel_checker, &start.pose, smoothing_start);
     const auto finish = std::chrono::steady_clock::now();
     using Milliseconds = std::chrono::duration<double, std::milli>;
-    RCLCPP_INFO(
-      logger_, "RBS_NAVFN_SMOOTHING process_ms=%.3f total_ms=%.3f result=%s raw_poses=%zu output_poses=%zu",
-      Milliseconds(finish - process_start).count(), Milliseconds(finish - smoothing_start).count(),
-      result.reason.c_str(), path.poses.size(), result.path.poses.size());
+    const double total_ms = Milliseconds(finish - smoothing_start).count();
+    if (total_ms > 200.0 || result.reason != "smoothed") {
+      RCLCPP_INFO(
+        logger_, "RBS_NAVFN_SMOOTHING process_ms=%.3f total_ms=%.3f result=%s raw_poses=%zu output_poses=%zu",
+        Milliseconds(finish - process_start).count(), total_ms, result.reason.c_str(),
+        path.poses.size(), result.path.poses.size());
+    }
     if (result.cancelled) {
       throw nav2_core::PlannerCancelled("Path smoothing cancelled");
     }
