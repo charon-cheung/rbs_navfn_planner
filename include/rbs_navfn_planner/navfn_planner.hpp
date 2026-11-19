@@ -108,14 +108,7 @@ protected:
     nav_msgs::msg::Path & plan);
 
   /**
-   * @brief Compute the navigation function given a seed point in the world to start from
-   * @param world_point Point in world coordinate frame
-   * @return true if can compute
-   */
-  bool computePotential(const geometry_msgs::msg::Point & world_point);
-
-  /**
-   * @brief Compute a plan to a goal from a potential - must call computePotential first
+   * @brief Extract a plan to the goal from the computed potential field
    * @param goal Goal pose
    * @param plan Path to be computed
    * @return true if can compute a plan path
@@ -134,18 +127,11 @@ protected:
     nav_msgs::msg::Path & plan);
 
   /**
-   * @brief Compute the potential, or navigation cost, at a given point in the world
-   *        must call computePotential first
+   * @brief Read the computed potential at a given point in the world
    * @param world_point Point in world coordinate frame
    * @return double point potential (navigation cost)
    */
   double getPointPotential(const geometry_msgs::msg::Point & world_point);
-
-  // Check for a valid potential value at a given point in the world
-  // - must call computePotential first
-  // - currently unused
-  // bool validPointPotential(const geometry_msgs::msg::Point & world_point);
-  // bool validPointPotential(const geometry_msgs::msg::Point & world_point, double tolerance);
 
   /**
    * @brief Compute the squared distance between two points

@@ -80,23 +80,6 @@ namespace rbs_navfn_planner
 #define PRIORITYBUFSIZE 10000
 
 /**
-  Navigation function call.
-  \param costmap Cost map array, of type COSTTYPE; origin is upper left
-    NOTE: will be modified to have a border of obstacle costs
-  \param nx Width of map in cells
-  \param ny Height of map in cells
-  \param goal X,Y position of goal cell
-  \param start X,Y position of start cell
-
-Returns length of plan if found, and fills an array with x,y interpolated
-positions at about 1/2 cell resolution; else returns 0.
-*/
-int create_nav_plan_astar(
-  const COSTTYPE * costmap, int nx, int ny,
-  int * goal, int * start,
-  float * plan, int nplan);
-
-/**
  * @class NavFn
  * @brief Navigation function class. Holds buffers for costmap, navfn map. Maps are pixel-based.
  *  Origin is upper left, x is right, y is down.
@@ -273,16 +256,6 @@ public:
   float gradCell(int n);  /**< calculates gradient at cell <n>, returns norm */
 
   float pathStep;  /**< step size for following gradient */
-
-  /** display callback */
-  /**< <n> is the number of cycles between updates  */
-  // void display(void fn(NavFn * nav), int n = 100);
-  // int displayInt;  /**< save second argument of display() above */
-  // void (* displayFn)(NavFn * nav);  /**< display function itself */
-
-  /** save costmap */
-  /**< write out costmap and start/goal states as fname.pgm and fname.txt */
-  // void savemap(const char * fname);
 };
 
 }  // namespace rbs_navfn_planner

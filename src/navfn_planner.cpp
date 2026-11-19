@@ -32,7 +32,6 @@
 #include <string>
 #include <vector>
 
-#include "builtin_interfaces/msg/duration.hpp"
 #include "rbs_navfn_planner/navfn.hpp"
 #include "nav2_util/costmap.hpp"
 #include "nav2_util/node_utils.hpp"
@@ -624,43 +623,6 @@ NavfnPlanner::getPointPotential(const geometry_msgs::msg::Point & world_point)
   unsigned int index = my * planner_->nx + mx;
   return planner_->potarr[index];
 }
-
-// bool
-// NavfnPlanner::validPointPotential(const geometry_msgs::msg::Point & world_point)
-// {
-//   return validPointPotential(world_point, tolerance_);
-// }
-
-// bool
-// NavfnPlanner::validPointPotential(
-//   const geometry_msgs::msg::Point & world_point, double tolerance)
-// {
-//   const double resolution = costmap_->getResolution();
-
-//   geometry_msgs::msg::Point p = world_point;
-//   double potential = getPointPotential(p);
-//   if (potential < POT_HIGH) {
-//     // world_point is reachable by itself
-//     return true;
-//   } else {
-//     // world_point, is not reachable. Trying to find any
-//     // reachable point within its tolerance region
-//     p.y = world_point.y - tolerance;
-//     while (p.y <= world_point.y + tolerance) {
-//       p.x = world_point.x - tolerance;
-//       while (p.x <= world_point.x + tolerance) {
-//         potential = getPointPotential(p);
-//         if (potential < POT_HIGH) {
-//           return true;
-//         }
-//         p.x += resolution;
-//       }
-//       p.y += resolution;
-//     }
-//   }
-
-//   return false;
-// }
 
 bool
 NavfnPlanner::worldToMap(double wx, double wy, unsigned int & mx, unsigned int & my)

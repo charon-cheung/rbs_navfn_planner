@@ -51,61 +51,6 @@ namespace rbs_navfn_planner
 {
 
 //
-// function to perform nav fn calculation
-// keeps track of internal buffers, will be more efficient
-//   if the size of the environment does not change
-//
-
-// Example usage:
-/*
-int
-create_nav_plan_astar(
-  COSTTYPE * costmap, int nx, int ny,
-  int * goal, int * start,
-  float * plan, int nplan)
-{
-  static NavFn * nav = NULL;
-
-  if (nav == NULL) {
-    nav = new NavFn(nx, ny);
-  }
-
-  if (nav->nx != nx || nav->ny != ny) {  // check for compatibility with previous call
-    delete nav;
-    nav = new NavFn(nx, ny);
-  }
-
-  nav->setGoal(goal);
-  nav->setStart(start);
-
-  nav->costarr = costmap;
-  nav->setupNavFn(true);
-
-  // calculate the nav fn and path
-  nav->priInc = 2 * COST_NEUTRAL;
-  nav->propNavFnAstar(std::max(nx * ny / 20, nx + ny));
-
-  // path
-  int len = nav->calcPath(nplan);
-
-  if (len > 0) {  // found plan
-    RCLCPP_DEBUG(rclcpp::get_logger("rclcpp"), "[NavFn] Path found, %d steps\n", len);
-  } else {
-    RCLCPP_DEBUG(rclcpp::get_logger("rclcpp"), "[NavFn] No path found\n");
-  }
-
-  if (len > 0) {
-    for (int i = 0; i < len; i++) {
-      plan[i * 2] = nav->pathx[i];
-      plan[i * 2 + 1] = nav->pathy[i];
-    }
-  }
-
-  return len;
-}
-*/
-
-//
 // create nav fn buffers
 //
 
@@ -131,9 +76,6 @@ NavFn::NavFn(int xs, int ys)
   goal[0] = goal[1] = 0;
   start[0] = start[1] = 0;
 
-  // display function
-  // displayFn = NULL;
-  // displayInt = 0;
 
   // path buffers
   npathbuf = npath = 0;
@@ -426,9 +368,6 @@ NavFn::updateCell(int n)
   const float r = potarr[n + 1];
   const float u = potarr[n - nx];
   const float d = potarr[n + nx];
-  // ROS_INFO("[Update] c: %0.1f  l: %0.1f  r: %0.1f  u: %0.1f  d: %0.1f\n",
-  //  potarr[n], l, r, u, d);
-  // ROS_INFO("[Update] cost: %d\n", costarr[n]);
 
   // find lowest, and its lowest neighbor
   float ta, tc;
@@ -457,7 +396,6 @@ NavFn::updateCell(int n)
       pot = ta + hf * v;
     }
 
-    //      ROS_INFO("[Update] new pot: %d\n", costarr[n]);
 
     // now add affected neighbors to priority blocks
     if (pot < potarr[n]) {
@@ -500,9 +438,6 @@ NavFn::updateCellAstar(int n)
   float r = potarr[n + 1];
   float u = potarr[n - nx];
   float d = potarr[n + nx];
-  // ROS_INFO("[Update] c: %0.1f  l: %0.1f  r: %0.1f  u: %0.1f  d: %0.1f\n",
-  // potarr[n], l, r, u, d);
-  // ROS_INFO("[Update] cost of %d: %d\n", n, costarr[n]);
 
   // find lowest, and its lowest neighbor
   float ta, tc;
@@ -531,7 +466,6 @@ NavFn::updateCellAstar(int n)
       pot = ta + hf * v;
     }
 
-    // ROS_INFO("[Update] new pot: %d\n", costarr[n]);
 
     // now add affected neighbors to priority blocks
     if (pot < potarr[n]) {
@@ -609,10 +543,6 @@ NavFn::propNavFnDijkstra(int cycles, std::function<bool()> cancelChecker, bool a
     while (i-- > 0) {
       updateCell(*pb++);
     }
-
-    // if (displayInt > 0 && (cycle % displayInt) == 0) {
-    //   displayFn(this);
-    // }
 
     // swap priority blocks curP <=> nextP
     curPe = nextPe;
@@ -700,10 +630,6 @@ NavFn::propNavFnAstar(int cycles, std::function<bool()> cancelChecker)
       updateCellAstar(*pb++);
     }
 
-    // if (displayInt > 0 && (cycle % displayInt) == 0) {
-    //   displayFn(this);
-    // }
-
     // swap priority blocks curP <=> nextP
     curPe = nextPe;
     nextPe = 0;
@@ -763,7 +689,6 @@ int
 NavFn::calcPath(int n, int * st)
 {
   // test write
-  // savemap("test");
 
   // check path arrays
   if (npathbuf < n) {
@@ -867,7 +792,6 @@ NavFn::calcPath(int n, int * st)
 
       if (potarr[stc] >= POT_HIGH) {
         RCLCPP_DEBUG(rclcpp::get_logger("rclcpp"), "[PathCalc] No path found, high potential");
-        // savemap("navfn_highpot");
         return 0;
       }
     } else {  // have a good gradient here
@@ -886,15 +810,6 @@ NavFn::calcPath(int n, int * st)
       float y2 = (1.0 - dx) * grady[stcnx] + dx * grady[stcnx + 1];
       float y = (1.0 - dy) * y1 + dy * y2;  // interpolated y
 
-#if 0
-      // show gradients
-      RCLCPP_DEBUG(
-        rclcpp::get_logger("rclcpp"),
-        "[Path] %0.2f,%0.2f  %0.2f,%0.2f  %0.2f,%0.2f  %0.2f,%0.2f; final x=%.3f, y=%.3f\n",
-        gradx[stc], grady[stc], gradx[stc + 1], grady[stc + 1],
-        gradx[stcnx], grady[stcnx], gradx[stcnx + 1], grady[stcnx + 1],
-        x, y);
-#endif
 
       // check for zero gradient, failed
       if (x == 0.0 && y == 0.0) {
@@ -913,14 +828,9 @@ NavFn::calcPath(int n, int * st)
       if (dy > 1.0) {stc += nx; dy -= 1.0;}
       if (dy < -1.0) {stc -= nx; dy += 1.0;}
     }
-
-    //      ROS_INFO("[Path] Pot: %0.1f  grad: %0.1f,%0.1f  pos: %0.1f,%0.1f\n",
-    //      potarr[stc], x, y, pathx[npath-1], pathy[npath-1]);
   }
 
-  //  return npath;  // out of cycles, return failure
   RCLCPP_DEBUG(rclcpp::get_logger("rclcpp"), "[PathCalc] No path found, path too long");
-  // savemap("navfn_pathlong");
   return 0;  // out of cycles, return failure
 }
 
@@ -985,55 +895,5 @@ NavFn::gradCell(int n)
   }
   return norm;
 }
-
-
-//
-// display function setup
-// <n> is the number of cycles to wait before displaying,
-//     use 0 to turn it off
-
-// void
-// NavFn::display(void fn(NavFn * nav), int n)
-// {
-//   displayFn = fn;
-//   displayInt = n;
-// }
-
-
-//
-// debug writes
-// saves costmap and start/goal
-//
-
-// void
-// NavFn::savemap(const char * fname)
-// {
-//   char fn[4096];
-
-//   RCLCPP_DEBUG(rclcpp::get_logger("rclcpp"), "[NavFn] Saving costmap and start/goal points");
-//   // write start and goal points
-//   snprintf(fn, sizeof(fn), "%s.txt", fname);
-//   FILE * fp = fopen(fn, "w");
-//   if (!fp) {
-//     RCLCPP_WARN(rclcpp::get_logger("rclcpp"), "Can't open file %s", fn);
-//     return;
-//   }
-//   fprintf(fp, "Goal: %d %d\nStart: %d %d\n", goal[0], goal[1], start[0], start[1]);
-//   fclose(fp);
-
-//   // write cost array
-//   if (!costarr) {
-//     return;
-//   }
-//   snprintf(fn, sizeof(fn), "%s.pgm", fname);
-//   fp = fopen(fn, "wb");
-//   if (!fp) {
-//     RCLCPP_WARN(rclcpp::get_logger("rclcpp"), "Can't open file %s", fn);
-//     return;
-//   }
-//   fprintf(fp, "P5\n%d\n%d\n%d\n", nx, ny, 0xff);
-//   fwrite(costarr, 1, nx * ny, fp);
-//   fclose(fp);
-// }
 
 }  // namespace rbs_navfn_planner
