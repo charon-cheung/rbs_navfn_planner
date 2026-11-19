@@ -289,6 +289,7 @@ TEST(NavfnTest, PublishesRawAndReturnsTheSelectedPathForFollowPath)
   Path raw_msg, smooth_msg;
   for (bool enabled : {false, true, false}) {
     ASSERT_TRUE(node->set_parameters_atomically({
+        rclcpp::Parameter("GridBased.use_astar", enabled),
         rclcpp::Parameter("GridBased.enable_path_smoothing", enabled),
         rclcpp::Parameter("GridBased.max_smoothing_time_ms", 1000.0)}).successful);
     const auto selected = planner.createPlan(start, goal, [] {return false;});

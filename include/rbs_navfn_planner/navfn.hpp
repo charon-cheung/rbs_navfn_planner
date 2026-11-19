@@ -145,8 +145,9 @@ public:
   int getPathLen();
 
   /**
-   * @brief  Gets the cost of the path found the last time a navigation function was computed
-   * @return The cost of the last path found
+   * @brief Return the start-cell potential from the last completed A* propagation.
+   * @return POT_HIGH before the first A* result or if A* did not reach the start cell.
+   * Dijkstra does not update this value.
    */
   float getLastPathCost();
 
@@ -239,7 +240,7 @@ public:
   int npath;  /**< number of path points */
   int npathbuf;  /**< size of pathx, pathy buffers */
 
-  float last_path_cost_;  /**< Holds the cost of the path found the last time A* was called */
+  float last_path_cost_{POT_HIGH};
 
   /**
    * @brief  Calculates the path for at mose <n> cycles
