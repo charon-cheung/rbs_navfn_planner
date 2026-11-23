@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <string>
@@ -41,6 +42,68 @@ TEST(NavfnTest, RenamedPluginLoadsFromRbsPackage)
     "nav2_core", "nav2_core::GlobalPlanner");
   EXPECT_EQ(loader.getClassPackage("rbs_navfn_planner::NavfnPlanner"), "rbs_navfn_planner");
   EXPECT_NE(loader.createSharedInstance("rbs_navfn_planner::NavfnPlanner"), nullptr);
+}
+
+TEST(NavfnTest, GridFallbackChoosesLowestFractionalPotential)
+{
+  rbs_navfn_planner::NavFn navfn(7, 7);
+  int start[] = {3, 3};
+  int goal[] = {5, 3};
+  navfn.setStart(start);
+  navfn.setGoal(goal);
+  std::fill_n(navfn.potarr, navfn.ns, POT_HIGH);
+  navfn.potarr[3 * navfn.nx + 3] = 160.0f;
+  navfn.potarr[2 * navfn.nx + 2] = 100.8f;  // Scanned first, dead end.
+  navfn.potarr[3 * navfn.nx + 4] = 100.2f;  // Lower neighbor leads to the goal.
+  navfn.potarr[3 * navfn.nx + 5] = 0.0f;
+
+  ASSERT_EQ(navfn.calcPath(10), 3);
+  EXPECT_FLOAT_EQ(navfn.getPathX()[1], 4.0f);
+  EXPECT_FLOAT_EQ(navfn.getPathY()[1], 3.0f);
+}
+
+TEST(NavfnTest, PathExtractionChecksBorderBeforeReadingNeighbors)
+{
+  rbs_navfn_planner::NavFn navfn(7, 5);
+  int edges[][2] = {{0, 2}, {6, 2}, {3, 0}, {3, 4}, {0, 0}, {6, 0}, {0, 4}, {6, 4}};
+  for (auto & edge : edges) {
+    SCOPED_TRACE(::testing::Message() << "edge=(" << edge[0] << "," << edge[1] << ")");
+    const int index = edge[1] * navfn.nx + edge[0];
+    std::fill_n(navfn.potarr, navfn.ns, POT_HIGH);
+    // A zero potential across a row boundary must never be reached in one step.
+    int distant_goal[] = {edge[0] == 0 ? 6 : 0, edge[0] == 0 ? 1 : 3};
+    navfn.setGoal(distant_goal);
+    navfn.potarr[distant_goal[1] * navfn.nx + distant_goal[0]] = 0.0f;
+    EXPECT_EQ(navfn.calcPath(4, edge), 0);
+
+    // The adjacent interior cell can still reach a legitimate border goal.
+    std::fill_n(navfn.potarr, navfn.ns, POT_HIGH);
+    int inside[] = {std::clamp(edge[0], 1, navfn.nx - 2), std::clamp(edge[1], 1, navfn.ny - 2)};
+    navfn.setGoal(edge);
+    navfn.potarr[index] = 0.0f;
+    navfn.potarr[inside[1] * navfn.nx + inside[0]] = COST_NEUTRAL;
+    ASSERT_EQ(navfn.calcPath(4, inside), 2);
+    EXPECT_FLOAT_EQ(navfn.getPathX()[1], edge[0]);
+    EXPECT_FLOAT_EQ(navfn.getPathY()[1], edge[1]);
+  }
+  int outside[] = {navfn.nx, navfn.ny - 2};  // Aliases the next row if flattened unchecked.
+  navfn.potarr[(outside[1] + 1) * navfn.nx] = 0.0f;
+  EXPECT_EQ(navfn.calcPath(4, outside), 0);
+}
+
+TEST(NavfnTest, GradientRequiresFourInMapNeighbors)
+{
+  rbs_navfn_planner::NavFn navfn(7, 5);
+  navfn.setupNavFn();
+  navfn.potarr[13] = 0.0f;  // Across the left edge from cell 14.
+  for (int n : {-1, 0, 3, 14, 20, 28, 31, 34, navfn.ns}) {
+    EXPECT_FLOAT_EQ(navfn.gradCell(n), 0.0f) << "cell " << n;
+  }
+  const int inside = navfn.nx + 1;
+  navfn.potarr[inside] = COST_NEUTRAL;
+  navfn.potarr[inside - 1] = 0.0f;
+  EXPECT_GT(navfn.gradCell(inside), 0.0f);
+  EXPECT_LT(navfn.gradx[inside], 0.0f);
 }
 
 class OpenMapPlanner : public rbs_navfn_planner::NavfnPlanner
@@ -79,6 +142,7 @@ public:
   }
 
   unsigned char cellCost(unsigned int x, unsigned int y) const {return map_.getCost(x, y);}
+  nav2_costmap_2d::Costmap2D & map() {return map_;}
 
   void setTolerance(double tolerance) {tolerance_ = tolerance;}
 
@@ -97,6 +161,38 @@ public:
 private:
   nav2_costmap_2d::Costmap2D map_;
 };
+
+TEST(NavfnTest, RepeatedPlansUseCurrentCostsAndMapDimensions)
+{
+  for (bool astar : {false, true}) {
+    SCOPED_TRACE(astar ? "A*" : "Dijkstra");
+    OpenMapPlanner planner(astar, false);
+    auto & map = planner.map();
+    const unsigned int wall_x = map.getSizeInCellsX() / 2;
+    const unsigned int opening_y = map.getSizeInCellsY() / 2;
+    for (unsigned int y = 0; y < map.getSizeInCellsY(); ++y) {
+      map.setCost(wall_x, y, nav2_costmap_2d::LETHAL_OBSTACLE);
+    }
+    geometry_msgs::msg::PoseStamped start, goal;
+    start.pose.orientation.w = goal.pose.orientation.w = 1.0;
+    start.pose.position.x = -1.0;
+    goal.pose.position.x = 1.0;
+    const auto plan = [&] {return planner.createPlan(start, goal, [] {return false;});};
+
+    map.setCost(wall_x, opening_y, nav2_costmap_2d::FREE_SPACE);
+    ASSERT_FALSE(plan().poses.empty());
+    map.setCost(wall_x, opening_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+    EXPECT_THROW(plan(), nav2_core::NoValidPathCouldBeFound);
+    map.setCost(wall_x, opening_y, nav2_costmap_2d::FREE_SPACE);
+    ASSERT_FALSE(plan().poses.empty());
+
+    map.resizeMap(240, 200, map.getResolution(), map.getOriginX(), map.getOriginY());
+    goal.pose.position.x = 6.0;  // Beyond the old map's upper x bound of 5 m.
+    const auto expanded = plan();
+    ASSERT_FALSE(expanded.poses.empty());
+    EXPECT_EQ(expanded.poses.back().pose.position, goal.pose.position);
+  }
+}
 
 TEST(NavfnTest, GoalShortcutPreservesPrefixGoalAndCostBoundary)
 {
@@ -360,6 +456,44 @@ TEST(NavfnTest, PublishesRawAndReturnsTheSelectedPathForFollowPath)
       EXPECT_FALSE(smoothed->take(smooth_msg, info));
     }
   }
+  planner.deactivate();
+  planner.cleanup();
+  costmap->on_cleanup(rclcpp_lifecycle::State());
+}
+
+TEST(NavfnTest, GoalToleranceMustBeFiniteAndNonnegative)
+{
+  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("goal_tolerance_test");
+  auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>("tolerance_costmap");
+  costmap->on_configure(rclcpp_lifecycle::State());
+  node->declare_parameter("test.tolerance", 0.0);
+  rbs_navfn_planner::NavfnPlanner planner;
+  const double infinity = std::numeric_limits<double>::infinity();
+  const double invalid[] = {-0.1, infinity, -infinity, std::numeric_limits<double>::quiet_NaN()};
+  for (double value : invalid) {
+    ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("test.tolerance", value)).successful);
+    EXPECT_THROW(planner.configure(node, "test", nullptr, costmap), nav2_core::PlannerException);
+  }
+  ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("test.tolerance", 0.0)).successful);
+  planner.configure(node, "test", nullptr, costmap);
+  planner.activate();
+  ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("test.tolerance", 0.2)).successful);
+  ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("test.tolerance", 0.0)).successful);
+  for (double value : invalid) {
+    const auto result = node->set_parameters_atomically({
+      rclcpp::Parameter("test.enable_path_smoothing", true),
+      rclcpp::Parameter("test.tolerance", value)});
+    EXPECT_FALSE(result.successful);
+    EXPECT_FALSE(node->get_parameter("test.enable_path_smoothing").as_bool());
+    EXPECT_DOUBLE_EQ(node->get_parameter("test.tolerance").as_double(), 0.0);
+  }
+  // A rejected batch must also leave the planner using exact-goal semantics.
+  auto * map = costmap->getCostmap();
+  map->resizeMap(10, 10, 0.1, 0, 0);
+  map->setCost(5, 5, nav2_costmap_2d::LETHAL_OBSTACLE);
+  geometry_msgs::msg::PoseStamped pose;
+  map->mapToWorld(5, 5, pose.pose.position.x, pose.pose.position.y);
+  EXPECT_THROW(planner.createPlan(pose, pose, [] {return false;}), nav2_core::GoalOccupied);
   planner.deactivate();
   planner.cleanup();
   costmap->on_cleanup(rclcpp_lifecycle::State());

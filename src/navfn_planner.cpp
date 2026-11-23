@@ -45,6 +45,13 @@ using std::placeholders::_1;
 
 namespace rbs_navfn_planner
 {
+namespace
+{
+bool validGoalTolerance(double tolerance)
+{
+  return std::isfinite(tolerance) && tolerance >= 0.0;
+}
+}  // namespace
 
 enum class NavfnPlanner::PlanStage {lock, prepare, search, tolerance, extract, heading,
   snapshot, smooth, publish, finish, count};
@@ -86,6 +93,9 @@ NavfnPlanner::configure(
   // Declare this plugin's parameters
   declare_parameter_if_not_declared(node, name + ".tolerance", rclcpp::ParameterValue(0.5));
   node->get_parameter(name + ".tolerance", tolerance_);
+  if (!validGoalTolerance(tolerance_)) {
+    throw nav2_core::PlannerException(name + ".tolerance must be finite and nonnegative");
+  }
   declare_parameter_if_not_declared(node, name + ".use_astar", rclcpp::ParameterValue(false));
   node->get_parameter(name + ".use_astar", use_astar_);
   declare_parameter_if_not_declared(node, name + ".allow_unknown", rclcpp::ParameterValue(true));
@@ -217,13 +227,6 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
     throw nav2_core::GoalOccupied(
             "Goal Coordinates of(" + std::to_string(goal.pose.position.x) + ", " +
             std::to_string(goal.pose.position.y) + ") was in lethal cost");
-  }
-
-  // Update planner based on the new costmap size
-  if (isPlannerOutOfDate()) {
-    planner_->setNavArr(
-      costmap_->getSizeInCellsX(),
-      costmap_->getSizeInCellsY());
   }
 
   nav_msgs::msg::Path path;
@@ -370,10 +373,11 @@ bool NavfnPlanner::makePlanTimed(
     }
   }
 
-  // make sure to resize the underlying array that Navfn uses
-  planner_->setNavArr(
-    costmap_->getSizeInCellsX(),
-    costmap_->getSizeInCellsY());
+  if (isPlannerOutOfDate()) {
+    planner_->setNavArr(
+      costmap_->getSizeInCellsX(),
+      costmap_->getSizeInCellsY());
+  }
 
   planner_->setCostmap(costmap_->getCharMap(), true, allow_unknown_);
 
@@ -680,9 +684,11 @@ NavfnPlanner::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameter
   std::lock_guard<std::mutex> lock(planner_mutex_);
   rcl_interfaces::msg::SetParametersResult result;
   auto smoothing = smoothing_options_;
+  double tolerance = tolerance_;
   bool enabled = enable_path_smoothing_;
   for (const auto & parameter : parameters) {
     const auto & name = parameter.get_name();
+    if (name == name_ + ".tolerance") {tolerance = parameter.as_double();}
     if (name == name_ + ".enable_path_smoothing") {enabled = parameter.as_bool();}
     if (name == name_ + ".use_rdp") {smoothing.use_rdp = parameter.as_bool();}
     if (name == name_ + ".rdp_epsilon") {smoothing.rdp_epsilon = parameter.as_double();}
@@ -692,23 +698,25 @@ NavfnPlanner::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameter
       smoothing.max_smoothing_time_ms = parameter.as_double();
     }
   }
+  if (!validGoalTolerance(tolerance)) {
+    result.successful = false;
+    result.reason = name_ + ".tolerance must be finite and nonnegative";
+    return result;
+  }
   if (!rbs_navfn_smoother::validSmoothingOptions(smoothing)) {
     result.successful = false;
     result.reason =
       "Smoothing spacing/time must be positive, epsilon/deviation nonnegative and finite";
     return result;
   }
+  tolerance_ = tolerance;
   smoothing_options_ = smoothing;
   enable_path_smoothing_ = enabled;
   for (auto parameter : parameters) {
     const auto & type = parameter.get_type();
     const auto & name = parameter.get_name();
 
-    if (type == ParameterType::PARAMETER_DOUBLE) {
-      if (name == name_ + ".tolerance") {
-        tolerance_ = parameter.as_double();
-      }
-    } else if (type == ParameterType::PARAMETER_BOOL) {
+    if (type == ParameterType::PARAMETER_BOOL) {
       if (name == name_ + ".use_astar") {
         use_astar_ = parameter.as_bool();
       } else if (name == name_ + ".allow_unknown") {

@@ -44,6 +44,7 @@
 #include "rbs_navfn_planner/navfn.hpp"
 
 #include <algorithm>
+#include <memory>
 #include "nav2_core/planner_exceptions.hpp"
 #include "rclcpp/rclcpp.hpp"
 
@@ -148,36 +149,28 @@ NavFn::setStart(int * g)
 void
 NavFn::setNavArr(int xs, int ys)
 {
-  RCLCPP_DEBUG(rclcpp::get_logger("rclcpp"), "[NavFn] Array is %d x %d\n", xs, ys);
+  RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "[NavFn] Array is %d x %d\n", xs, ys);
 
+  const int cells = xs * ys;
+  auto new_costs = std::make_unique<COSTTYPE[]>(cells);
+  std::unique_ptr<float[]> new_potentials(new float[cells]);
+  auto new_pending = std::make_unique<bool[]>(cells);
+  std::unique_ptr<float[]> new_gradx(new float[cells]);
+  std::unique_ptr<float[]> new_grady(new float[cells]);
+
+  delete[] costarr;
+  delete[] potarr;
+  delete[] pending;
+  delete[] gradx;
+  delete[] grady;
+  costarr = new_costs.release();
+  potarr = new_potentials.release();
+  pending = new_pending.release();
+  gradx = new_gradx.release();
+  grady = new_grady.release();
   nx = xs;
   ny = ys;
-  ns = nx * ny;
-
-  if (costarr) {
-    delete[] costarr;
-  }
-  if (potarr) {
-    delete[] potarr;
-  }
-  if (pending) {
-    delete[] pending;
-  }
-
-  if (gradx) {
-    delete[] gradx;
-  }
-  if (grady) {
-    delete[] grady;
-  }
-
-  costarr = new COSTTYPE[ns];  // cost array, 2d config space
-  memset(costarr, 0, ns * sizeof(COSTTYPE));
-  potarr = new float[ns];  // navigation potential array
-  pending = new bool[ns];
-  memset(pending, 0, ns * sizeof(bool));
-  gradx = new float[ns];
-  grady = new float[ns];
+  ns = cells;
 }
 
 
@@ -692,45 +685,49 @@ NavFn::calcPath(int n, int * st)
 
   // check path arrays
   if (npathbuf < n) {
-    if (pathx) {delete[] pathx;}
-    if (pathy) {delete[] pathy;}
-    pathx = new float[n];
-    pathy = new float[n];
+    std::unique_ptr<float[]> new_pathx(new float[n]);
+    std::unique_ptr<float[]> new_pathy(new float[n]);
+    delete[] pathx;
+    delete[] pathy;
+    pathx = new_pathx.release();
+    pathy = new_pathy.release();
     npathbuf = n;
   }
 
   // set up start position at cell
   // st is always upper left corner for 4-point bilinear interpolation
   if (st == NULL) {st = start;}
+  npath = 0;
+  if (st[0] < 0 || st[0] >= nx || st[1] < 0 || st[1] >= ny) {return 0;}
   int stc = st[1] * nx + st[0];
 
   // set up offset
   float dx = 0;
   float dy = 0;
-  npath = 0;
 
   // go for <n> cycles at most
   for (int i = 0; i < n; i++) {
     // check if near goal
-    int nearest_point = std::max(
-      0,
-      std::min(
-        nx * ny - 1, stc + static_cast<int>(round(dx)) +
-        static_cast<int>(nx * round(dy))));
+    const int x_cell = stc % nx, y_cell = stc / nx;
+    const int nearest_x = x_cell + static_cast<int>(round(dx));
+    const int nearest_y = y_cell + static_cast<int>(round(dy));
+    if (nearest_x < 0 || nearest_x >= nx || nearest_y < 0 || nearest_y >= ny) {return 0;}
+    const int nearest_point = nearest_y * nx + nearest_x;
     if (potarr[nearest_point] < COST_NEUTRAL) {
       pathx[npath] = static_cast<float>(goal[0]);
       pathy[npath] = static_cast<float>(goal[1]);
       return ++npath;  // done!
     }
 
-    if (stc < nx || stc > ns - nx) {  // would be out of bounds
+    // A border goal can finish above. Continuing needs a complete 3x3 neighborhood.
+    if (x_cell == 0 || x_cell == nx - 1 || y_cell == 0 || y_cell == ny - 1) {
       RCLCPP_DEBUG(rclcpp::get_logger("rclcpp"), "[PathCalc] Out of bounds");
       return 0;
     }
 
     // add to path
-    pathx[npath] = stc % nx + dx;
-    pathy[npath] = stc / nx + dy;
+    pathx[npath] = x_cell + dx;
+    pathy[npath] = y_cell + dy;
     npath++;
 
     bool oscillation_detected = false;
@@ -765,7 +762,7 @@ NavFn::calcPath(int n, int * st)
 
       // check eight neighbors to find the lowest
       int minc = stc;
-      int minp = potarr[stc];
+      float minp = potarr[stc];
       int sti = stcpx - 1;
       if (potarr[sti] < minp) {minp = potarr[sti]; minc = sti;}
       sti++;
@@ -844,12 +841,11 @@ NavFn::calcPath(int n, int * st)
 float
 NavFn::gradCell(int n)
 {
+  if (n < nx || n >= ns - nx || n % nx == 0 || n % nx == nx - 1) {
+    return 0.0;
+  }
   if (gradx[n] + grady[n] > 0.0) {  // check this cell
     return 1.0;
-  }
-
-  if (n < nx || n > ns - nx) {  // would be out of bounds
-    return 0.0;
   }
 
   float cv = potarr[n];
