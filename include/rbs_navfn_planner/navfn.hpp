@@ -39,32 +39,27 @@
 #ifndef RBS_NAVFN_PLANNER__NAVFN_HPP_
 #define RBS_NAVFN_PLANNER__NAVFN_HPP_
 
-#include <math.h>
-#include <stdint.h>
-#include <string.h>
-#include <stdio.h>
 #include <functional>
 
 namespace rbs_navfn_planner
 {
 
-// cost defs
-#define COST_UNKNOWN_ROS 255  // 255 is unknown cost
-#define COST_OBS 254  // 254 for forbidden regions
-#define COST_OBS_ROS 253  // ROS values of 253 are obstacles
+inline constexpr int kRosUnknownCost = 255;
+inline constexpr int kObstacleCost = 254;  // Impassable in the NavFn cost array.
+inline constexpr int kRosObstacleThreshold = 253;  // First inscribed obstacle cost in ROS.
 
 // navfn cost values are set to
-// COST_NEUTRAL + COST_FACTOR * costmap_cost_value.
+// kNeutralCost + kCostFactor * costmap_cost_value.
 // Incoming costmap cost values are in the range 0 to 252.
-// With COST_NEUTRAL of 50, the COST_FACTOR needs to be about 0.8 to
+// With kNeutralCost of 50, kCostFactor needs to be about 0.8 to
 // ensure the input values are spread evenly over the output range, 50
-// to 253.  If COST_FACTOR is higher, cost values will have a plateau
+// to 253.  If kCostFactor is higher, cost values will have a plateau
 // around obstacles and the planner will then treat (for example) the
 // whole width of a narrow hallway as equally undesirable and thus
 // will not plan paths down the center.
 
-#define COST_NEUTRAL 50  // Set this to "open space" value
-#define COST_FACTOR 0.8  // Used for translating costs in NavFn::setCostmap()
+inline constexpr int kNeutralCost = 50;  // Set this to "open space" value
+inline constexpr double kCostFactor = 0.8;  // Used for translating costs in NavFn::setCostmap()
 
 // Define the cost type in the case that it is not set. However, this allows
 // clients to modify it without changing the file. Arguably, it is better to require it to
@@ -73,11 +68,8 @@ namespace rbs_navfn_planner
 #define COSTTYPE unsigned char  // Whatever is used...
 #endif
 
-// potential defs
-#define POT_HIGH 1.0e10  // unassigned cell potential
-
-// priority buffers
-#define PRIORITYBUFSIZE 10000
+inline constexpr double kUnassignedPotential = 1.0e10;
+inline constexpr int kPriorityBufferSize = 10000;
 
 /**
  * @class NavFn
@@ -146,7 +138,7 @@ public:
 
   /**
    * @brief Return the start-cell potential from the last completed A* propagation.
-   * @return POT_HIGH before the first A* result or if A* did not reach the start cell.
+   * @return kUnassignedPotential before the first A* result or if A* did not reach the start cell.
    * Dijkstra does not update this value.
    */
   float getLastPathCost();
@@ -211,7 +203,7 @@ public:
 
   /**
    * @brief  Set up navigation potential arrays for new propagation
-   * @param keepit whether or not use COST_NEUTRAL
+   * @param keepit whether or not use kNeutralCost
    */
   void setupNavFn(bool keepit = false);
 
@@ -240,14 +232,14 @@ public:
   int npath;  /**< number of path points */
   int npathbuf;  /**< size of pathx, pathy buffers */
 
-  float last_path_cost_{POT_HIGH};
+  float last_path_cost_{kUnassignedPotential};
 
   /**
    * @brief  Calculates the path for at mose <n> cycles
    * @param n The maximum number of cycles to run for
    * @return The lenght of the path found, 0 if none
    */
-  int calcPath(int n, int * st = NULL);
+  int calcPath(int n, int * st = nullptr);
 
   /**
    * @brief  Calculate gradient at a cell
@@ -257,6 +249,9 @@ public:
   float gradCell(int n);  /**< calculates gradient at cell <n>, returns norm */
 
   float pathStep;  /**< step size for following gradient */
+
+private:
+  void pushCell(int cell, int * buffer, int & count);
 };
 
 }  // namespace rbs_navfn_planner

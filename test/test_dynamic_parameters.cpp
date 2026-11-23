@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License. Reserved.
 
-#include <math.h>
-
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <thread>
@@ -51,7 +50,7 @@ TEST(NavfnTest, GridFallbackChoosesLowestFractionalPotential)
   int goal[] = {5, 3};
   navfn.setStart(start);
   navfn.setGoal(goal);
-  std::fill_n(navfn.potarr, navfn.ns, POT_HIGH);
+  std::fill_n(navfn.potarr, navfn.ns, rbs_navfn_planner::kUnassignedPotential);
   navfn.potarr[3 * navfn.nx + 3] = 160.0f;
   navfn.potarr[2 * navfn.nx + 2] = 100.8f;  // Scanned first, dead end.
   navfn.potarr[3 * navfn.nx + 4] = 100.2f;  // Lower neighbor leads to the goal.
@@ -69,7 +68,7 @@ TEST(NavfnTest, PathExtractionChecksBorderBeforeReadingNeighbors)
   for (auto & edge : edges) {
     SCOPED_TRACE(::testing::Message() << "edge=(" << edge[0] << "," << edge[1] << ")");
     const int index = edge[1] * navfn.nx + edge[0];
-    std::fill_n(navfn.potarr, navfn.ns, POT_HIGH);
+    std::fill_n(navfn.potarr, navfn.ns, rbs_navfn_planner::kUnassignedPotential);
     // A zero potential across a row boundary must never be reached in one step.
     int distant_goal[] = {edge[0] == 0 ? 6 : 0, edge[0] == 0 ? 1 : 3};
     navfn.setGoal(distant_goal);
@@ -77,11 +76,11 @@ TEST(NavfnTest, PathExtractionChecksBorderBeforeReadingNeighbors)
     EXPECT_EQ(navfn.calcPath(4, edge), 0);
 
     // The adjacent interior cell can still reach a legitimate border goal.
-    std::fill_n(navfn.potarr, navfn.ns, POT_HIGH);
+    std::fill_n(navfn.potarr, navfn.ns, rbs_navfn_planner::kUnassignedPotential);
     int inside[] = {std::clamp(edge[0], 1, navfn.nx - 2), std::clamp(edge[1], 1, navfn.ny - 2)};
     navfn.setGoal(edge);
     navfn.potarr[index] = 0.0f;
-    navfn.potarr[inside[1] * navfn.nx + inside[0]] = COST_NEUTRAL;
+    navfn.potarr[inside[1] * navfn.nx + inside[0]] = rbs_navfn_planner::kNeutralCost;
     ASSERT_EQ(navfn.calcPath(4, inside), 2);
     EXPECT_FLOAT_EQ(navfn.getPathX()[1], edge[0]);
     EXPECT_FLOAT_EQ(navfn.getPathY()[1], edge[1]);
@@ -100,7 +99,7 @@ TEST(NavfnTest, GradientRequiresFourInMapNeighbors)
     EXPECT_FLOAT_EQ(navfn.gradCell(n), 0.0f) << "cell " << n;
   }
   const int inside = navfn.nx + 1;
-  navfn.potarr[inside] = COST_NEUTRAL;
+  navfn.potarr[inside] = rbs_navfn_planner::kNeutralCost;
   navfn.potarr[inside - 1] = 0.0f;
   EXPECT_GT(navfn.gradCell(inside), 0.0f);
   EXPECT_LT(navfn.gradx[inside], 0.0f);
@@ -456,6 +455,11 @@ TEST(NavfnTest, PublishesRawAndReturnsTheSelectedPathForFollowPath)
       EXPECT_FALSE(smoothed->take(smooth_msg, info));
     }
   }
+  // Smoothing is off. The cancelled single-pose request must not publish a raw plan.
+  EXPECT_THROW(planner.createPlan(start, start, [] {return true;}), nav2_core::PlannerCancelled);
+  const auto next_plan = planner.createPlan(start, goal, [] {return false;});
+  ASSERT_TRUE(wait_until([&] {return raw->take(raw_msg, info);}));
+  EXPECT_EQ(raw_msg, next_plan);
   planner.deactivate();
   planner.cleanup();
   costmap->on_cleanup(rclcpp_lifecycle::State());

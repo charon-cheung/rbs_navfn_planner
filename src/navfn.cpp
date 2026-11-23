@@ -44,6 +44,8 @@
 #include "rbs_navfn_planner/navfn.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <memory>
 #include "nav2_core/planner_exceptions.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -51,27 +53,39 @@
 namespace rbs_navfn_planner
 {
 
+constexpr double kInvSqrt2 = 0.707106781;
+
+// NavFn approximates the two-neighbor potential increment as a fraction of the cell cost.
+// The polynomial input is the difference between neighbor potentials divided by the cell cost.
+constexpr double kQuadraticTerm = -0.2301;
+constexpr double kLinearTerm = 0.5307;
+constexpr double kConstantTerm = 0.7040;
+
 //
 // create nav fn buffers
 //
 
 NavFn::NavFn(int xs, int ys)
 {
+  // Keep the priority buffers owned locally until the cell arrays are ready.
+  std::unique_ptr<int[]> priority1(new int[kPriorityBufferSize]);
+  std::unique_ptr<int[]> priority2(new int[kPriorityBufferSize]);
+  std::unique_ptr<int[]> priority3(new int[kPriorityBufferSize]);
+
   // create cell arrays
-  costarr = NULL;
-  potarr = NULL;
-  pending = NULL;
-  gradx = grady = NULL;
+  costarr = nullptr;
+  potarr = nullptr;
+  pending = nullptr;
+  gradx = grady = nullptr;
   setNavArr(xs, ys);
 
-  // priority buffers
-  pb1 = new int[PRIORITYBUFSIZE];
-  pb2 = new int[PRIORITYBUFSIZE];
-  pb3 = new int[PRIORITYBUFSIZE];
+  pb1 = priority1.release();
+  pb2 = priority2.release();
+  pb3 = priority3.release();
 
-  // for Dijkstra (breadth-first), set to COST_NEUTRAL
-  // for A* (best-first), set to COST_NEUTRAL
-  priInc = 2 * COST_NEUTRAL;
+  // for Dijkstra (breadth-first), set to kNeutralCost
+  // for A* (best-first), set to kNeutralCost
+  priInc = 2 * kNeutralCost;
 
   // goal and start
   goal[0] = goal[1] = 0;
@@ -80,7 +94,7 @@ NavFn::NavFn(int xs, int ys)
 
   // path buffers
   npathbuf = npath = 0;
-  pathx = pathy = NULL;
+  pathx = pathy = nullptr;
   pathStep = 0.5;
 }
 
@@ -186,20 +200,18 @@ NavFn::setCostmap(const COSTTYPE * cmap, bool isROS, bool allow_unknown)
     for (int i = 0; i < ny; i++) {
       int k = i * nx;
       for (int j = 0; j < nx; j++, k++, cmap++, cm++) {
-        // This transforms the incoming cost values:
-        // COST_OBS                 -> COST_OBS (incoming "lethal obstacle")
-        // COST_OBS_ROS             -> COST_OBS (incoming "inscribed inflated obstacle")
-        // values in range 0 to 252 -> values from COST_NEUTRAL to COST_OBS_ROS.
-        *cm = COST_OBS;
+        // Inscribed and lethal cells map to kObstacleCost.
+        // Scale traversable ROS costs below that threshold.
+        *cm = kObstacleCost;
         int v = *cmap;
-        if (v < COST_OBS_ROS) {
-          v = COST_NEUTRAL + COST_FACTOR * v;
-          if (v >= COST_OBS) {
-            v = COST_OBS - 1;
+        if (v < kRosObstacleThreshold) {
+          v = kNeutralCost + kCostFactor * v;
+          if (v >= kObstacleCost) {
+            v = kObstacleCost - 1;
           }
           *cm = v;
-        } else if (v == COST_UNKNOWN_ROS && allow_unknown) {
-          v = COST_OBS - 1;
+        } else if (v == kRosUnknownCost && allow_unknown) {
+          v = kObstacleCost - 1;
           *cm = v;
         }
       }
@@ -208,19 +220,19 @@ NavFn::setCostmap(const COSTTYPE * cmap, bool isROS, bool allow_unknown)
     for (int i = 0; i < ny; i++) {
       int k = i * nx;
       for (int j = 0; j < nx; j++, k++, cmap++, cm++) {
-        *cm = COST_OBS;
+        *cm = kObstacleCost;
         if (i < 7 || i > ny - 8 || j < 7 || j > nx - 8) {
           continue;  // don't do borders
         }
         int v = *cmap;
-        if (v < COST_OBS_ROS) {
-          v = COST_NEUTRAL + COST_FACTOR * v;
-          if (v >= COST_OBS) {
-            v = COST_OBS - 1;
+        if (v < kRosObstacleThreshold) {
+          v = kNeutralCost + kCostFactor * v;
+          if (v >= kObstacleCost) {
+            v = kObstacleCost - 1;
           }
           *cm = v;
-        } else if (v == COST_UNKNOWN_ROS) {
-          v = COST_OBS - 1;
+        } else if (v == kRosUnknownCost) {
+          v = kObstacleCost - 1;
           *cm = v;
         }
       }
@@ -259,17 +271,16 @@ float * NavFn::getPathX() {return pathx;}
 float * NavFn::getPathY() {return pathy;}
 int NavFn::getPathLen() {return npath;}
 
-// inserting onto the priority blocks
-#define push_cur(n)  {if (n >= 0 && n < ns && !pending[n] && \
-  costarr[n] < COST_OBS && curPe < PRIORITYBUFSIZE) \
-  {curP[curPe++] = n; pending[n] = true;}}
-#define push_next(n) {if (n >= 0 && n < ns && !pending[n] && \
-  costarr[n] < COST_OBS && nextPe < PRIORITYBUFSIZE) \
-  {nextP[nextPe++] = n; pending[n] = true;}}
-#define push_over(n) {if (n >= 0 && n < ns && !pending[n] && \
-  costarr[n] < COST_OBS && overPe < PRIORITYBUFSIZE) \
-  {overP[overPe++] = n; pending[n] = true;}}
-
+void
+NavFn::pushCell(int cell, int * buffer, int & count)
+{
+  if (cell >= 0 && cell < ns && !pending[cell] &&
+    costarr[cell] < kObstacleCost && count < kPriorityBufferSize)
+  {
+    buffer[count++] = cell;
+    pending[cell] = true;
+  }
+}
 
 // Set up navigation potential arrays for new propagation
 
@@ -278,9 +289,9 @@ NavFn::setupNavFn(bool keepit)
 {
   // reset values in propagation arrays
   for (int i = 0; i < ns; i++) {
-    potarr[i] = POT_HIGH;
+    potarr[i] = kUnassignedPotential;
     if (!keepit) {
-      costarr[i] = COST_NEUTRAL;
+      costarr[i] = kNeutralCost;
     }
     gradx[i] = grady[i] = 0.0;
   }
@@ -289,30 +300,30 @@ NavFn::setupNavFn(bool keepit)
   COSTTYPE * pc;
   pc = costarr;
   for (int i = 0; i < nx; i++) {
-    *pc++ = COST_OBS;
+    *pc++ = kObstacleCost;
   }
   pc = costarr + (ny - 1) * nx;
   for (int i = 0; i < nx; i++) {
-    *pc++ = COST_OBS;
+    *pc++ = kObstacleCost;
   }
   pc = costarr;
   for (int i = 0; i < ny; i++, pc += nx) {
-    *pc = COST_OBS;
+    *pc = kObstacleCost;
   }
   pc = costarr + nx - 1;
   for (int i = 0; i < ny; i++, pc += nx) {
-    *pc = COST_OBS;
+    *pc = kObstacleCost;
   }
 
   // priority buffers
-  curT = COST_OBS;
+  curT = kObstacleCost;
   curP = pb1;
   curPe = 0;
   nextP = pb2;
   nextPe = 0;
   overP = pb3;
   overPe = 0;
-  memset(pending, 0, ns * sizeof(bool));
+  std::memset(pending, 0, ns * sizeof(bool));
 
   // set goal
   int k = goal[0] + goal[1] * nx;
@@ -322,7 +333,7 @@ NavFn::setupNavFn(bool keepit)
   pc = costarr;
   int ntot = 0;
   for (int i = 0; i < ns; i++, pc++) {
-    if (*pc >= COST_OBS) {
+    if (*pc >= kObstacleCost) {
       ntot++;  // number of cells that are obstacles
     }
   }
@@ -336,10 +347,10 @@ void
 NavFn::initCost(int k, float v)
 {
   potarr[k] = v;
-  push_cur(k + 1);
-  push_cur(k - 1);
-  push_cur(k - nx);
-  push_cur(k + nx);
+  pushCell(k + 1, curP, curPe);
+  pushCell(k - 1, curP, curPe);
+  pushCell(k - nx, curP, curPe);
+  pushCell(k + nx, curP, curPe);
 }
 
 
@@ -350,8 +361,6 @@ NavFn::initCost(int k, float v)
 // Quadratic approximation to the interpolated value
 // No checking of bounds here, this function should be fast
 //
-
-#define INVSQRT2 0.707106781
 
 inline void
 NavFn::updateCell(int n)
@@ -368,7 +377,7 @@ NavFn::updateCell(int n)
   if (u < d) {ta = u;} else {ta = d;}
 
   // do planar wave update
-  if (costarr[n] < COST_OBS) {  // don't propagate into obstacles
+  if (costarr[n] < kObstacleCost) {  // don't propagate into obstacles
     float hf = static_cast<float>(costarr[n]);  // traversability factor
     float dc = tc - ta;  // relative cost between ta,tc
     if (dc < 0) {  // ta is lowest
@@ -381,32 +390,29 @@ NavFn::updateCell(int n)
     if (dc >= hf) {  // if too large, use ta-only update
       pot = ta + hf;
     } else {  // two-neighbor interpolation update
-      // use quadratic approximation
-      // might speed this up through table lookup, but still have to
-      //   do the divide
       const float div = dc / hf;
-      const float v = -0.2301 * div * div + 0.5307 * div + 0.7040;
+      const float v = kQuadraticTerm * div * div + kLinearTerm * div + kConstantTerm;
       pot = ta + hf * v;
     }
 
 
     // now add affected neighbors to priority blocks
     if (pot < potarr[n]) {
-      float le = INVSQRT2 * static_cast<float>(costarr[n - 1]);
-      float re = INVSQRT2 * static_cast<float>(costarr[n + 1]);
-      float ue = INVSQRT2 * static_cast<float>(costarr[n - nx]);
-      float de = INVSQRT2 * static_cast<float>(costarr[n + nx]);
+      float le = kInvSqrt2 * static_cast<float>(costarr[n - 1]);
+      float re = kInvSqrt2 * static_cast<float>(costarr[n + 1]);
+      float ue = kInvSqrt2 * static_cast<float>(costarr[n - nx]);
+      float de = kInvSqrt2 * static_cast<float>(costarr[n + nx]);
       potarr[n] = pot;
       if (pot < curT) {  // low-cost buffer block
-        if (l > pot + le) {push_next(n - 1);}
-        if (r > pot + re) {push_next(n + 1);}
-        if (u > pot + ue) {push_next(n - nx);}
-        if (d > pot + de) {push_next(n + nx);}
+        if (l > pot + le) {pushCell(n - 1, nextP, nextPe);}
+        if (r > pot + re) {pushCell(n + 1, nextP, nextPe);}
+        if (u > pot + ue) {pushCell(n - nx, nextP, nextPe);}
+        if (d > pot + de) {pushCell(n + nx, nextP, nextPe);}
       } else {  // overflow block
-        if (l > pot + le) {push_over(n - 1);}
-        if (r > pot + re) {push_over(n + 1);}
-        if (u > pot + ue) {push_over(n - nx);}
-        if (d > pot + de) {push_over(n + nx);}
+        if (l > pot + le) {pushCell(n - 1, overP, overPe);}
+        if (r > pot + re) {pushCell(n + 1, overP, overPe);}
+        if (u > pot + ue) {pushCell(n - nx, overP, overPe);}
+        if (d > pot + de) {pushCell(n + nx, overP, overPe);}
       }
     }
   }
@@ -420,8 +426,6 @@ NavFn::updateCell(int n)
 // Quadratic approximation to the interpolated value
 // No checking of bounds here, this function should be fast
 //
-
-#define INVSQRT2 0.707106781
 
 inline void
 NavFn::updateCellAstar(int n)
@@ -438,7 +442,7 @@ NavFn::updateCellAstar(int n)
   if (u < d) {ta = u;} else {ta = d;}
 
   // do planar wave update
-  if (costarr[n] < COST_OBS) {  // don't propagate into obstacles
+  if (costarr[n] < kObstacleCost) {  // don't propagate into obstacles
     float hf = static_cast<float>(costarr[n]);  // traversability factor
     float dc = tc - ta;  // relative cost between ta,tc
     if (dc < 0) {  // ta is lowest
@@ -451,39 +455,36 @@ NavFn::updateCellAstar(int n)
     if (dc >= hf) {  // if too large, use ta-only update
       pot = ta + hf;
     } else {  // two-neighbor interpolation update
-      // use quadratic approximation
-      // might speed this up through table lookup, but still have to
-      //   do the divide
       const float div = dc / hf;
-      const float v = -0.2301 * div * div + 0.5307 * div + 0.7040;
+      const float v = kQuadraticTerm * div * div + kLinearTerm * div + kConstantTerm;
       pot = ta + hf * v;
     }
 
 
     // now add affected neighbors to priority blocks
     if (pot < potarr[n]) {
-      float le = INVSQRT2 * static_cast<float>(costarr[n - 1]);
-      float re = INVSQRT2 * static_cast<float>(costarr[n + 1]);
-      float ue = INVSQRT2 * static_cast<float>(costarr[n - nx]);
-      float de = INVSQRT2 * static_cast<float>(costarr[n + nx]);
+      float le = kInvSqrt2 * static_cast<float>(costarr[n - 1]);
+      float re = kInvSqrt2 * static_cast<float>(costarr[n + 1]);
+      float ue = kInvSqrt2 * static_cast<float>(costarr[n - nx]);
+      float de = kInvSqrt2 * static_cast<float>(costarr[n + nx]);
 
       // calculate distance
       int x = n % nx;
       int y = n / nx;
-      float dist = hypot(x - start[0], y - start[1]) * static_cast<float>(COST_NEUTRAL);
+      float dist = std::hypot(x - start[0], y - start[1]) * static_cast<float>(kNeutralCost);
 
       potarr[n] = pot;
       pot += dist;
       if (pot < curT) {  // low-cost buffer block
-        if (l > pot + le) {push_next(n - 1);}
-        if (r > pot + re) {push_next(n + 1);}
-        if (u > pot + ue) {push_next(n - nx);}
-        if (d > pot + de) {push_next(n + nx);}
+        if (l > pot + le) {pushCell(n - 1, nextP, nextPe);}
+        if (r > pot + re) {pushCell(n + 1, nextP, nextPe);}
+        if (u > pot + ue) {pushCell(n - nx, nextP, nextPe);}
+        if (d > pot + de) {pushCell(n + nx, nextP, nextPe);}
       } else {
-        if (l > pot + le) {push_over(n - 1);}
-        if (r > pot + re) {push_over(n + 1);}
-        if (u > pot + ue) {push_over(n - nx);}
-        if (d > pot + de) {push_over(n + nx);}
+        if (l > pot + le) {pushCell(n - 1, overP, overPe);}
+        if (r > pot + re) {pushCell(n + 1, overP, overPe);}
+        if (u > pot + ue) {pushCell(n - nx, overP, overPe);}
+        if (d > pot + de) {pushCell(n + nx, overP, overPe);}
       }
     }
   }
@@ -556,7 +557,7 @@ NavFn::propNavFnDijkstra(int cycles, std::function<bool()> cancelChecker, bool a
 
     // check if we've hit the Start cell
     if (atStart) {
-      if (potarr[startCell] < POT_HIGH) {
+      if (potarr[startCell] < kUnassignedPotential) {
         break;
       }
     }
@@ -587,7 +588,7 @@ NavFn::propNavFnAstar(int cycles, std::function<bool()> cancelChecker)
   int cycle = 0;  // which cycle we're on
 
   // set initial threshold, based on distance
-  float dist = hypot(goal[0] - start[0], goal[1] - start[1]) * static_cast<float>(COST_NEUTRAL);
+  float dist = std::hypot(goal[0] - start[0], goal[1] - start[1]) * static_cast<float>(kNeutralCost);
   curT = dist + curT;
 
   // set up start cell
@@ -641,7 +642,7 @@ NavFn::propNavFnAstar(int cycles, std::function<bool()> cancelChecker)
     }
 
     // check if we've hit the Start cell
-    if (potarr[startCell] < POT_HIGH) {
+    if (potarr[startCell] < kUnassignedPotential) {
       break;
     }
   }
@@ -653,7 +654,7 @@ NavFn::propNavFnAstar(int cycles, std::function<bool()> cancelChecker)
     "[NavFn] Used %d cycles, %d cells visited (%d%%), priority buf max %d\n",
     cycle, nc, (int)((nc * 100.0) / (ns - nobs)), nwv);
 
-  if (potarr[startCell] < POT_HIGH) {
+  if (potarr[startCell] < kUnassignedPotential) {
     return true;  // finished up here}
   } else {
     return false;
@@ -696,7 +697,7 @@ NavFn::calcPath(int n, int * st)
 
   // set up start position at cell
   // st is always upper left corner for 4-point bilinear interpolation
-  if (st == NULL) {st = start;}
+  if (st == nullptr) {st = start;}
   npath = 0;
   if (st[0] < 0 || st[0] >= nx || st[1] < 0 || st[1] >= ny) {return 0;}
   int stc = st[1] * nx + st[0];
@@ -709,11 +710,11 @@ NavFn::calcPath(int n, int * st)
   for (int i = 0; i < n; i++) {
     // check if near goal
     const int x_cell = stc % nx, y_cell = stc / nx;
-    const int nearest_x = x_cell + static_cast<int>(round(dx));
-    const int nearest_y = y_cell + static_cast<int>(round(dy));
+    const int nearest_x = x_cell + static_cast<int>(std::round(dx));
+    const int nearest_y = y_cell + static_cast<int>(std::round(dy));
     if (nearest_x < 0 || nearest_x >= nx || nearest_y < 0 || nearest_y >= ny) {return 0;}
     const int nearest_point = nearest_y * nx + nearest_x;
-    if (potarr[nearest_point] < COST_NEUTRAL) {
+    if (potarr[nearest_point] < kNeutralCost) {
       pathx[npath] = static_cast<float>(goal[0]);
       pathy[npath] = static_cast<float>(goal[1]);
       return ++npath;  // done!
@@ -745,15 +746,15 @@ NavFn::calcPath(int n, int * st)
     int stcpx = stc - nx;
 
     // check for potentials at eight positions near cell
-    if (potarr[stc] >= POT_HIGH ||
-      potarr[stc + 1] >= POT_HIGH ||
-      potarr[stc - 1] >= POT_HIGH ||
-      potarr[stcnx] >= POT_HIGH ||
-      potarr[stcnx + 1] >= POT_HIGH ||
-      potarr[stcnx - 1] >= POT_HIGH ||
-      potarr[stcpx] >= POT_HIGH ||
-      potarr[stcpx + 1] >= POT_HIGH ||
-      potarr[stcpx - 1] >= POT_HIGH ||
+    if (potarr[stc] >= kUnassignedPotential ||
+      potarr[stc + 1] >= kUnassignedPotential ||
+      potarr[stc - 1] >= kUnassignedPotential ||
+      potarr[stcnx] >= kUnassignedPotential ||
+      potarr[stcnx + 1] >= kUnassignedPotential ||
+      potarr[stcnx - 1] >= kUnassignedPotential ||
+      potarr[stcpx] >= kUnassignedPotential ||
+      potarr[stcpx + 1] >= kUnassignedPotential ||
+      potarr[stcpx - 1] >= kUnassignedPotential ||
       oscillation_detected)
     {
       RCLCPP_DEBUG(
@@ -787,7 +788,7 @@ NavFn::calcPath(int n, int * st)
         rclcpp::get_logger("rclcpp"), "[Path] Pot: %0.1f  pos: %0.1f,%0.1f",
         potarr[stc], pathx[npath - 1], pathy[npath - 1]);
 
-      if (potarr[stc] >= POT_HIGH) {
+      if (potarr[stc] >= kUnassignedPotential) {
         RCLCPP_DEBUG(rclcpp::get_logger("rclcpp"), "[PathCalc] No path found, high potential");
         return 0;
       }
@@ -815,7 +816,7 @@ NavFn::calcPath(int n, int * st)
       }
 
       // move in the right direction
-      float ss = pathStep / hypot(x, y);
+      float ss = pathStep / std::hypot(x, y);
       dx += x * ss;
       dy += y * ss;
 
@@ -844,7 +845,7 @@ NavFn::gradCell(int n)
   if (n < nx || n >= ns - nx || n % nx == 0 || n % nx == nx - 1) {
     return 0.0;
   }
-  if (gradx[n] + grady[n] > 0.0) {  // check this cell
+  if (gradx[n] != 0.0f || grady[n] != 0.0f) {
     return 1.0;
   }
 
@@ -853,37 +854,37 @@ NavFn::gradCell(int n)
   float dy = 0.0;
 
   // check for in an obstacle
-  if (cv >= POT_HIGH) {
-    if (potarr[n - 1] < POT_HIGH) {
-      dx = -COST_OBS;
-    } else if (potarr[n + 1] < POT_HIGH) {
-      dx = COST_OBS;
+  if (cv >= kUnassignedPotential) {
+    if (potarr[n - 1] < kUnassignedPotential) {
+      dx = -kObstacleCost;
+    } else if (potarr[n + 1] < kUnassignedPotential) {
+      dx = kObstacleCost;
     }
-    if (potarr[n - nx] < POT_HIGH) {
-      dy = -COST_OBS;
-    } else if (potarr[n + nx] < POT_HIGH) {
-      dy = COST_OBS;
+    if (potarr[n - nx] < kUnassignedPotential) {
+      dy = -kObstacleCost;
+    } else if (potarr[n + nx] < kUnassignedPotential) {
+      dy = kObstacleCost;
     }
   } else {  // not in an obstacle
     // dx calc, average to sides
-    if (potarr[n - 1] < POT_HIGH) {
+    if (potarr[n - 1] < kUnassignedPotential) {
       dx += potarr[n - 1] - cv;
     }
-    if (potarr[n + 1] < POT_HIGH) {
+    if (potarr[n + 1] < kUnassignedPotential) {
       dx += cv - potarr[n + 1];
     }
 
     // dy calc, average to sides
-    if (potarr[n - nx] < POT_HIGH) {
+    if (potarr[n - nx] < kUnassignedPotential) {
       dy += potarr[n - nx] - cv;
     }
-    if (potarr[n + nx] < POT_HIGH) {
+    if (potarr[n + nx] < kUnassignedPotential) {
       dy += cv - potarr[n + nx];
     }
   }
 
   // normalize
-  float norm = hypot(dx, dy);
+  float norm = std::hypot(dx, dy);
   if (norm > 0) {
     norm = 1.0 / norm;
     gradx[n] = norm * dx;

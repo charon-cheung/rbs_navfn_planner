@@ -254,9 +254,12 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
             "Failed to create plan with tolerance of: " + std::to_string(tolerance_));
   }
 
-  const auto publish_raw = [&]() {
+  const auto publish_plan = [&](const auto & publisher) {
       enter(PlanStage::publish);
-      if (raw_plan_pub_) {raw_plan_pub_->publish(path);}
+      if (cancel_checker && cancel_checker()) {
+        throw nav2_core::PlannerCancelled("Planning cancelled before path publication");
+      }
+      if (publisher) {publisher->publish(path);}
     };
   if (enable_path_smoothing_) {
     enter(PlanStage::snapshot);
@@ -280,7 +283,7 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
     snapshot.data.assign(costmap_->getCharMap(), costmap_->getCharMap() + cell_count);
     const auto footprint = costmap_ros_->getRobotFootprint();
     costmap_lock.unlock();
-    publish_raw();
+    publish_plan(raw_plan_pub_);
 
     auto options = smoothing_options_;
     options.allow_unknown = allow_unknown_;
@@ -310,12 +313,11 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
       throw nav2_core::NoValidPathCouldBeFound("Path smoothing failed: " + result.reason);
     }
     path = std::move(result.path);
-    enter(PlanStage::publish);
-    if (smoothed_plan_pub_) {smoothed_plan_pub_->publish(path);}
+    publish_plan(smoothed_plan_pub_);
   } else {
     selected_path = "raw";
     costmap_lock.unlock();
-    publish_raw();
+    publish_plan(raw_plan_pub_);
   }
 
   enter(PlanStage::finish);
@@ -381,8 +383,8 @@ bool NavfnPlanner::makePlanTimed(
 
   planner_->setCostmap(costmap_->getCharMap(), true, allow_unknown_);
 
-  // ROS free space maps to COST_NEUTRAL in NavFn's private cost array.
-  planner_->costarr[sy * planner_->nx + sx] = COST_NEUTRAL;
+  // ROS free space maps to kNeutralCost in NavFn's private cost array.
+  planner_->costarr[sy * planner_->nx + sx] = kNeutralCost;
 
   int map_start[2] = {static_cast<int>(sx), static_cast<int>(sy)};
   int map_goal[2] = {static_cast<int>(gx), static_cast<int>(gy)};
@@ -403,7 +405,7 @@ bool NavfnPlanner::makePlanTimed(
 
   p = goal;
   double potential = getPointPotential(p.position);
-  if (potential < POT_HIGH) {
+  if (potential < kUnassignedPotential) {
     // Goal is reachable by itself
     best_pose = p;
     found_legal = true;
@@ -418,7 +420,7 @@ bool NavfnPlanner::makePlanTimed(
       while (p.position.x <= goal.position.x + tolerance) {
         potential = getPointPotential(p.position);
         double sdist = squared_distance(p, goal);
-        if (potential < POT_HIGH && sdist < best_sdist) {
+        if (potential < kUnassignedPotential && sdist < best_sdist) {
           best_sdist = sdist;
           best_pose = p;
           found_legal = true;
@@ -484,7 +486,7 @@ bool NavfnPlanner::makePlanTimed(
           }
           dx = last_pose.x - approach_pose.x;
           dy = last_pose.y - approach_pose.y;
-          theta = atan2(dy, dx);
+          theta = std::atan2(dy, dx);
           plan.poses.back().pose.orientation =
             nav2_util::geometry_utils::orientationAroundZAxis(theta);
         }
@@ -610,7 +612,7 @@ NavfnPlanner::getPlanFromPotential(
   const int & max_cycles = (costmap_->getSizeInCellsX() >= costmap_->getSizeInCellsY()) ?
     (costmap_->getSizeInCellsX() * 4) : (costmap_->getSizeInCellsY() * 4);
 
-  int path_len = planner_->calcPath(max_cycles);
+  const int path_len = planner_->calcPath(max_cycles);
   if (path_len == 0) {
     return false;
   }
@@ -618,16 +620,16 @@ NavfnPlanner::getPlanFromPotential(
   RCLCPP_DEBUG(logger_, "Path found, %d steps", path_len);
 
   // extract the plan
-  float * x = planner_->getPathX();
-  float * y = planner_->getPathY();
-  int len = planner_->getPathLen();
+  const float * x = planner_->getPathX();
+  const float * y = planner_->getPathY();
+  plan.poses.reserve(static_cast<size_t>(path_len) + 1);  // Allow for the exact goal pose.
 
-  for (int i = len - 1; i >= 0; --i) {
+  for (int i = path_len - 1; i >= 0; --i) {
     // convert the plan to world coordinates
     double world_x, world_y;
     mapToWorld(x[i], y[i], world_x, world_y);
 
-    geometry_msgs::msg::PoseStamped pose;
+    auto & pose = plan.poses.emplace_back();
     pose.header = plan.header;
     pose.pose.position.x = world_x;
     pose.pose.position.y = world_y;
@@ -636,7 +638,6 @@ NavfnPlanner::getPlanFromPotential(
     pose.pose.orientation.y = 0.0;
     pose.pose.orientation.z = 0.0;
     pose.pose.orientation.w = 1.0;
-    plan.poses.push_back(pose);
   }
 
   return !plan.poses.empty();
