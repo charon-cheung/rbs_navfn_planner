@@ -19,20 +19,20 @@
 // the Global Dynamic Window Approach. IEEE.
 // https://cs.stanford.edu/group/manips/publications/pdfs/Brock_1999_ICRA.pdf
 
-// #define BENCHMARK_TESTING
-
 #include "rbs_navfn_planner/navfn_planner.hpp"
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
-#include <iostream>
+#include <utility>
 #include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "rbs_navfn_planner/navfn.hpp"
+#include "rcpputils/scope_exit.hpp"
 #include "nav2_util/costmap.hpp"
 #include "nav2_util/node_utils.hpp"
 #include "nav2_costmap_2d/cost_values.hpp"
@@ -45,6 +45,9 @@ using std::placeholders::_1;
 
 namespace rbs_navfn_planner
 {
+
+enum class NavfnPlanner::PlanStage {lock, prepare, search, tolerance, extract, heading,
+  snapshot, smooth, publish, finish, count};
 
 NavfnPlanner::NavfnPlanner()
 : tf_(nullptr), costmap_(nullptr)
@@ -165,13 +168,38 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
   const geometry_msgs::msg::PoseStamped & goal,
   std::function<bool()> cancel_checker)
 {
+  const auto start_time = steady_clock::now();
+  auto last = start_time;
+  auto stage = PlanStage::lock;
+  std::array<double, static_cast<size_t>(PlanStage::count)> ms{};
+  const char * status = "failed";
+  std::string selected_path = "none";
+  const auto enter = [&](PlanStage next) {
+      const auto now = steady_clock::now();
+      ms[static_cast<size_t>(stage)] += duration<double, std::milli>(now - last).count();
+      last = now;
+      stage = next;
+    };
+  const auto timing_log = rcpputils::make_scope_exit([&] {
+      enter(PlanStage::finish);
+      const double total_ms = duration<double, std::milli>(last - start_time).count();
+      if (total_ms <= 300.0) {return;}
+      const auto elapsed = [&](PlanStage s) {return ms[static_cast<size_t>(s)];};
+      RCLCPP_WARN(
+        logger_, "RBS_NAVFN_PLAN_TIMING status=%s result=%s total_ms=%.3f lock_ms=%.3f "
+        "prepare_ms=%.3f search_ms=%.3f tolerance_ms=%.3f extract_ms=%.3f heading_ms=%.3f "
+        "snapshot_ms=%.3f smooth_ms=%.3f publish_ms=%.3f finish_ms=%.3f",
+        status, selected_path.c_str(), total_ms,
+        elapsed(PlanStage::lock), elapsed(PlanStage::prepare), elapsed(PlanStage::search),
+        elapsed(PlanStage::tolerance), elapsed(PlanStage::extract), elapsed(PlanStage::heading),
+        elapsed(PlanStage::snapshot), elapsed(PlanStage::smooth), elapsed(PlanStage::publish),
+        elapsed(PlanStage::finish));
+    });
   std::lock_guard<std::mutex> planner_lock(planner_mutex_);
   std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> costmap_lock(
     *(costmap_->getMutex()));
 
-#ifdef BENCHMARK_TESTING
-  steady_clock::time_point a = steady_clock::now();
-#endif
+  enter(PlanStage::prepare);
   unsigned int mx_start, my_start, mx_goal, my_goal;
   if (!costmap_->worldToMap(start.pose.position.x, start.pose.position.y, mx_start, my_start)) {
     throw nav2_core::StartOutsideMapBounds(
@@ -218,15 +246,17 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
       pose.pose.orientation = goal.pose.orientation;
     }
     path.poses.push_back(pose);
-  } else if (!makePlan(start.pose, goal.pose, tolerance_, cancel_checker, path)) {
+  } else if (!makePlanTimed(start.pose, goal.pose, tolerance_, cancel_checker, path, enter)) {
     throw nav2_core::NoValidPathCouldBeFound(
             "Failed to create plan with tolerance of: " + std::to_string(tolerance_));
   }
 
   const auto publish_raw = [&]() {
+      enter(PlanStage::publish);
       if (raw_plan_pub_) {raw_plan_pub_->publish(path);}
     };
   if (enable_path_smoothing_) {
+    enter(PlanStage::snapshot);
     const auto smoothing_start = std::chrono::steady_clock::now();
     if (cancel_checker && cancel_checker()) {
       throw nav2_core::PlannerCancelled("Path smoothing cancelled");
@@ -252,10 +282,13 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
     auto options = smoothing_options_;
     options.allow_unknown = allow_unknown_;
     options.use_final_approach_orientation = use_final_approach_orientation_;
+    enter(PlanStage::smooth);
     const auto process_start = std::chrono::steady_clock::now();
     auto result = rbs_navfn_smoother::processPath(
       path, snapshot, footprint, options, cancel_checker, &start.pose, smoothing_start);
     const auto finish = std::chrono::steady_clock::now();
+    enter(PlanStage::finish);
+    selected_path = result.reason;
     using Milliseconds = std::chrono::duration<double, std::milli>;
     const double total_ms = Milliseconds(finish - smoothing_start).count();
     if (total_ms > 200.0 || result.reason != "smoothed") {
@@ -274,19 +307,16 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
       throw nav2_core::NoValidPathCouldBeFound("Path smoothing failed: " + result.reason);
     }
     path = std::move(result.path);
+    enter(PlanStage::publish);
     if (smoothed_plan_pub_) {smoothed_plan_pub_->publish(path);}
   } else {
+    selected_path = "raw";
     costmap_lock.unlock();
     publish_raw();
   }
 
-
-#ifdef BENCHMARK_TESTING
-  steady_clock::time_point b = steady_clock::now();
-  duration<double> time_span = duration_cast<duration<double>>(b - a);
-  std::cout << "It took " << time_span.count() * 1000 << std::endl;
-#endif
-
+  enter(PlanStage::finish);
+  status = "ok";
   return path;
 }
 
@@ -308,6 +338,14 @@ NavfnPlanner::makePlan(
   const geometry_msgs::msg::Pose & goal, double tolerance,
   std::function<bool()> cancel_checker,
   nav_msgs::msg::Path & plan)
+{
+  return makePlanTimed(start, goal, tolerance, std::move(cancel_checker), plan, [](PlanStage) {});
+}
+
+bool NavfnPlanner::makePlanTimed(
+  const geometry_msgs::msg::Pose & start, const geometry_msgs::msg::Pose & goal,
+  double tolerance, std::function<bool()> cancel_checker, nav_msgs::msg::Path & plan,
+  const std::function<void(PlanStage)> & enter)
 {
   // clear the plan, just in case
   plan.poses.clear();
@@ -346,12 +384,14 @@ NavfnPlanner::makePlan(
   int map_goal[2] = {static_cast<int>(gx), static_cast<int>(gy)};
   planner_->setStart(map_goal);
   planner_->setGoal(map_start);
+  enter(PlanStage::search);
   if (use_astar_) {
     planner_->calcNavFnAstar(cancel_checker);
   } else {
     planner_->calcNavFnDijkstra(cancel_checker, true);
   }
 
+  enter(PlanStage::tolerance);
   double resolution = costmap_->getResolution();
   geometry_msgs::msg::Pose p, best_pose;
 
@@ -386,10 +426,12 @@ NavfnPlanner::makePlan(
   }
 
   if (found_legal) {
+    enter(PlanStage::extract);
     // extract the plan
     if (getPlanFromPotential(best_pose, plan)) {
       smoothApproachToGoal(best_pose, plan);
 
+      enter(PlanStage::heading);
       // Interior headings must describe both incoming and outgoing translation.
       // Bisect their wrapped angle so neither adjacent segment is favored.
       // Keep coincident samples aligned and leave the goal orientation policy below intact.

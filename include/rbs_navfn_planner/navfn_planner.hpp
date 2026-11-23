@@ -220,6 +220,12 @@ protected:
    */
   rcl_interfaces::msg::SetParametersResult
   dynamicParametersCallback(std::vector<rclcpp::Parameter> parameters);
+private:
+  enum class PlanStage;
+  bool makePlanTimed(
+    const geometry_msgs::msg::Pose & start, const geometry_msgs::msg::Pose & goal,
+    double tolerance, std::function<bool()> cancel_checker, nav_msgs::msg::Path & plan,
+    const std::function<void(PlanStage)> & enter);
 };
 
 }  // namespace rbs_navfn_planner
