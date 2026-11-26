@@ -114,6 +114,9 @@ NavfnPlanner::configure(
   declare_parameter_if_not_declared(node, name + ".output_spacing", rclcpp::ParameterValue(0.04));
   node->get_parameter(name + ".output_spacing", smoothing_options_.output_spacing);
   declare_parameter_if_not_declared(
+    node, name + ".reference_path_weight", rclcpp::ParameterValue(0.04));
+  node->get_parameter(name + ".reference_path_weight", smoothing_options_.reference_path_weight);
+  declare_parameter_if_not_declared(
     node, name + ".maximum_deviation", rclcpp::ParameterValue(0.10));
   node->get_parameter(name + ".maximum_deviation", smoothing_options_.maximum_deviation);
   declare_parameter_if_not_declared(
@@ -694,6 +697,9 @@ NavfnPlanner::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameter
     if (name == name_ + ".use_rdp") {smoothing.use_rdp = parameter.as_bool();}
     if (name == name_ + ".rdp_epsilon") {smoothing.rdp_epsilon = parameter.as_double();}
     if (name == name_ + ".output_spacing") {smoothing.output_spacing = parameter.as_double();}
+    if (name == name_ + ".reference_path_weight") {
+      smoothing.reference_path_weight = parameter.as_double();
+    }
     if (name == name_ + ".maximum_deviation") {smoothing.maximum_deviation = parameter.as_double();}
     if (name == name_ + ".max_smoothing_time_ms") {
       smoothing.max_smoothing_time_ms = parameter.as_double();
@@ -707,7 +713,8 @@ NavfnPlanner::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameter
   if (!rbs_navfn_smoother::validSmoothingOptions(smoothing)) {
     result.successful = false;
     result.reason =
-      "Smoothing spacing/time must be positive, epsilon/deviation nonnegative and finite";
+      "Smoothing spacing/time must be positive, epsilon/deviation nonnegative and finite, "
+      "reference_path_weight in [0, 0.2]";
     return result;
   }
   tolerance_ = tolerance;
